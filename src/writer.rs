@@ -621,6 +621,17 @@ impl HiveBuilder {
             if offset + cell_size as u32 <= bin_end {
                 break; // Cell fits in current bin
             }
+            
+            // Add the leftover space at end of current bin to free list
+            let leftover = bin_end - offset;
+            if leftover >= 8 {
+                // Minimum cell size is 8 bytes
+                self.free_cells.push(FreeCell {
+                    offset,
+                    size: leftover,
+                });
+            }
+            
             // Move to next bin's data area (after header)
             offset = bin_end + HIVE_BIN_HEADER_SIZE as u32;
             self.next_offset = offset;
