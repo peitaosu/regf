@@ -57,6 +57,14 @@ fn encode_utf16le_string(s: &str) -> Vec<u8> {
     bytes
 }
 
+fn align_up_u32(value: u32, alignment: u32) -> u32 {
+    if alignment == 0 {
+        return value;
+    }
+    let mask = alignment - 1;
+    (value + mask) & !mask
+}
+
 /// A value in the key tree.
 #[derive(Debug, Clone)]
 pub struct KeyTreeValue {
@@ -142,6 +150,8 @@ pub struct HiveBuilder {
     free_cells: Vec<FreeCell>,
     /// Current hive bins data size.
     hive_bins_size: u32,
+    /// Hive bin layout. Bins are contiguous and ordered by offset.
+    bins: Vec<HiveBinRegion>,
     /// Root key offset.
     root_offset: u32,
     /// Security descriptor cache (for deduplication, future use).
@@ -175,6 +185,24 @@ struct FreeCell {
     offset: u32,
     /// Size of this free cell.
     size: u32,
+}
+
+/// A hive bin region.
+#[derive(Debug, Clone, Copy)]
+struct HiveBinRegion {
+    /// Offset of this bin relative to hive bins data.
+    offset: u32,
+    /// Total size of this bin (header + data), multiple of 4096.
+    size: u32,
+}
+
+impl Default for HiveBinRegion {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            size: MIN_HIVE_BIN_SIZE as u32,
+        }
+    }
 }
 
 impl HiveBuilder {
@@ -211,6 +239,7 @@ impl HiveBuilder {
             cells: Vec::new(),
             free_cells: Vec::new(),
             hive_bins_size: MIN_HIVE_BIN_SIZE as u32,
+            bins: vec![HiveBinRegion::default()],
             root_offset: HIVE_BIN_HEADER_SIZE as u32,
             security_cache: HashMap::new(),
             next_offset: HIVE_BIN_HEADER_SIZE as u32,
@@ -269,6 +298,7 @@ impl HiveBuilder {
             cells: Vec::new(),
             free_cells: Vec::new(),
             hive_bins_size: MIN_HIVE_BIN_SIZE as u32,
+            bins: vec![HiveBinRegion::default()],
             root_offset: HIVE_BIN_HEADER_SIZE as u32,
             security_cache: HashMap::new(),
             next_offset: HIVE_BIN_HEADER_SIZE as u32,
@@ -495,24 +525,36 @@ impl HiveBuilder {
         self.allocate_cell_with_min_size(data, required_cell_size(data.len()))
     }
 
+    /// Find the bin containing `offset`.
+    fn bin_for_offset(&self, offset: u32) -> Option<HiveBinRegion> {
+        self.bins
+            .iter()
+            .copied()
+            .find(|bin| offset >= bin.offset && offset < bin.offset.saturating_add(bin.size))
+    }
+
     /// Calculate the end of the current bin for a given offset.
     fn bin_end_for_offset(&self, offset: u32) -> u32 {
-        let bin_index = offset / MIN_HIVE_BIN_SIZE as u32;
-        (bin_index + 1) * MIN_HIVE_BIN_SIZE as u32
+        self.bin_for_offset(offset)
+            .map(|bin| bin.offset + bin.size)
+            .unwrap_or(self.hive_bins_size)
     }
 
     /// Calculate the start of the data area in the bin for a given offset.
     /// This is after the 32-byte bin header.
     fn bin_data_start_for_offset(&self, offset: u32) -> u32 {
-        let bin_index = offset / MIN_HIVE_BIN_SIZE as u32;
-        bin_index * MIN_HIVE_BIN_SIZE as u32 + HIVE_BIN_HEADER_SIZE as u32
+        self.bin_for_offset(offset)
+            .map(|bin| bin.offset + HIVE_BIN_HEADER_SIZE as u32)
+            .unwrap_or(offset)
     }
 
     /// Check if an offset is valid (not within bin header area).
     fn is_valid_cell_offset(&self, offset: u32) -> bool {
-        let bin_start = (offset / MIN_HIVE_BIN_SIZE as u32) * MIN_HIVE_BIN_SIZE as u32;
-        let header_end = bin_start + HIVE_BIN_HEADER_SIZE as u32;
-        offset >= header_end
+        if let Some(bin) = self.bin_for_offset(offset) {
+            offset >= bin.offset + HIVE_BIN_HEADER_SIZE as u32
+        } else {
+            false
+        }
     }
 
     /// Ensure an offset is past the bin header. Returns adjusted offset if needed.
@@ -528,6 +570,26 @@ impl HiveBuilder {
     /// Allocate a cell with a minimum size (for cells that may grow).
     fn allocate_cell_with_min_size(&mut self, data: &[u8], min_size: usize) -> u32 {
         let cell_size = min_size.max(required_cell_size(data.len()));
+        let max_cell_in_bin = MIN_HIVE_BIN_SIZE - HIVE_BIN_HEADER_SIZE;
+
+        // Oversized cells can never fit in a standard bin payload area,
+        // so skip free-list scanning and go straight to dedicated-bin allocation.
+        if cell_size > max_cell_in_bin {
+            // Preserve any remaining space in the current bin before switching
+            // to a dedicated large-bin allocation path.
+            let offset = self.ensure_past_bin_header(self.next_offset);
+            let bin_end = self.bin_end_for_offset(offset);
+            if offset < bin_end {
+                let leftover = bin_end - offset;
+                if leftover >= 8 {
+                    self.free_cells.push(FreeCell {
+                        offset,
+                        size: leftover,
+                    });
+                }
+            }
+            return self.allocate_large_cell(data, cell_size);
+        }
 
         // Try to find a free cell that fits using best-fit strategy
         // (find the smallest free cell that fits to minimize fragmentation)
@@ -604,14 +666,6 @@ impl HiveBuilder {
         // First, ensure we're past any bin header
         let mut offset = self.ensure_past_bin_header(self.next_offset);
 
-        // Calculate maximum cell size that can fit in a bin
-        let max_cell_in_bin = MIN_HIVE_BIN_SIZE - HIVE_BIN_HEADER_SIZE;
-        
-        // If cell is too large to fit in any bin, this is an error
-        // (should use Index Root for large subkeys lists)
-        assert!(cell_size <= max_cell_in_bin, 
-            "Cell size {} exceeds maximum {} for a single bin", cell_size, max_cell_in_bin);
-
         // Check if cell would span bin boundary
         loop {
             // Ensure offset is past bin header
@@ -633,6 +687,9 @@ impl HiveBuilder {
             }
             
             // Move to next bin's data area (after header)
+            if bin_end >= self.hive_bins_size {
+                self.grow_hive();
+            }
             offset = bin_end + HIVE_BIN_HEADER_SIZE as u32;
             self.next_offset = offset;
         }
@@ -657,14 +714,57 @@ impl HiveBuilder {
         offset
     }
 
+    /// Allocate an oversized cell by creating a dedicated larger bin.
+    fn allocate_large_cell(&mut self, data: &[u8], cell_size: usize) -> u32 {
+        let min_bin_size = HIVE_BIN_HEADER_SIZE as u32 + cell_size as u32;
+        let bin_size = align_up_u32(min_bin_size, MIN_HIVE_BIN_SIZE as u32);
+        let bin_start = self.hive_bins_size;
+        self.bins.push(HiveBinRegion {
+            offset: bin_start,
+            size: bin_size,
+        });
+        self.hive_bins_size += bin_size;
+
+        let offset = bin_start + HIVE_BIN_HEADER_SIZE as u32;
+        self.cells.push(CellEntry {
+            offset,
+            data: data.to_vec(),
+            allocated_size: cell_size,
+        });
+
+        let used = HIVE_BIN_HEADER_SIZE as u32 + cell_size as u32;
+        let leftover = bin_size.saturating_sub(used);
+        if leftover >= 8 {
+            self.free_cells.push(FreeCell {
+                offset: offset + cell_size as u32,
+                size: leftover,
+            });
+        }
+
+        // Continue normal allocation after this dedicated bin.
+        self.next_offset = self.hive_bins_size;
+        offset
+    }
+
     /// Grow the hive by adding a new bin.
     fn grow_hive(&mut self) {
+        self.grow_hive_with_size(MIN_HIVE_BIN_SIZE as u32);
+    }
+
+    /// Grow the hive by appending a bin of `size` bytes.
+    fn grow_hive_with_size(&mut self, size: u32) {
         // Don't add remaining space as free cell here - it will be handled
         // when writing the hive. This avoids conflicts when free cells are
         // reused (which doesn't update next_offset).
-        
+        debug_assert!(size >= MIN_HIVE_BIN_SIZE as u32);
+        debug_assert_eq!(size % MIN_HIVE_BIN_SIZE as u32, 0);
+
         let new_bin_start = self.hive_bins_size;
-        self.hive_bins_size += MIN_HIVE_BIN_SIZE as u32;
+        self.bins.push(HiveBinRegion {
+            offset: new_bin_start,
+            size,
+        });
+        self.hive_bins_size += size;
         self.next_offset = new_bin_start + HIVE_BIN_HEADER_SIZE as u32;
     }
 
@@ -1202,29 +1302,47 @@ impl HiveBuilder {
 
     /// Build and write the hive to a writer.
     pub fn build_to_writer<W: Write + Seek>(&mut self, writer: &mut W) -> io::Result<()> {
+        let mut actual_hive_size = self
+            .bins
+            .first()
+            .map(|bin| bin.offset + bin.size)
+            .unwrap_or(self.hive_bins_size);
+
         // Validate all cell offsets before writing
         for cell in &self.cells {
-            let bin_start = (cell.offset / MIN_HIVE_BIN_SIZE as u32) * MIN_HIVE_BIN_SIZE as u32;
-            let header_end = bin_start + HIVE_BIN_HEADER_SIZE as u32;
+            let Some(bin) = self.bin_for_offset(cell.offset) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Cell at offset 0x{:08x} is outside known hive bins",
+                        cell.offset
+                    ),
+                ));
+            };
+            let header_end = bin.offset + HIVE_BIN_HEADER_SIZE as u32;
             if cell.offset < header_end {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Cell at offset 0x{:08x} is within bin header (bin starts at 0x{:08x}, data starts at 0x{:08x})",
-                        cell.offset, bin_start, header_end)
+                    format!(
+                        "Cell at offset 0x{:08x} is within bin header (bin starts at 0x{:08x}, data starts at 0x{:08x})",
+                        cell.offset, bin.offset, header_end
+                    ),
                 ));
             }
+            let cell_end = cell.offset + cell.allocated_size as u32;
+            let bin_end = bin.offset + bin.size;
+            if cell_end > bin_end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Cell at offset 0x{:08x} with size {} exceeds bin end 0x{:08x}",
+                        cell.offset, cell.allocated_size, bin_end
+                    ),
+                ));
+            }
+
+            actual_hive_size = actual_hive_size.max(bin_end);
         }
-        
-        // Calculate actual required size (only bins that contain cells)
-        let max_cell_end = self.cells.iter()
-            .map(|c| c.offset + c.allocated_size as u32)
-            .max()
-            .unwrap_or(HIVE_BIN_HEADER_SIZE as u32);
-        
-        // Round up to bin boundary
-        let actual_hive_size = ((max_cell_end + MIN_HIVE_BIN_SIZE as u32 - 1) 
-            / MIN_HIVE_BIN_SIZE as u32) * MIN_HIVE_BIN_SIZE as u32;
-        
         // Update base block with actual size (not pre-allocated size)
         self.base_block.hive_bins_data_size = actual_hive_size;
         self.base_block.root_cell_offset = self.root_offset;
@@ -1235,16 +1353,18 @@ impl HiveBuilder {
         self.base_block.write(writer)?;
 
         // Build hive bins (only bins that are needed)
-        let mut current_bin_offset = 0u32;
-
-        while current_bin_offset < actual_hive_size {
-            let bin_size = MIN_HIVE_BIN_SIZE as u32;
-            let bin_header = HiveBinHeader::new(current_bin_offset, bin_size);
+        for bin in self
+            .bins
+            .iter()
+            .filter(|bin| bin.offset < actual_hive_size)
+            .copied()
+        {
+            let bin_header = HiveBinHeader::new(bin.offset, bin.size);
             bin_header.write(writer)?;
 
             // Write cells in this bin
-            let bin_end = current_bin_offset + bin_size;
-            let mut cell_offset = current_bin_offset + HIVE_BIN_HEADER_SIZE as u32;
+            let bin_end = bin.offset + bin.size;
+            let mut cell_offset = bin.offset + HIVE_BIN_HEADER_SIZE as u32;
 
             // Collect cells in this bin
             let cells_in_bin: Vec<_> = self
@@ -1299,7 +1419,6 @@ impl HiveBuilder {
                 writer.write_all(&vec![0u8; free_size as usize - 4])?;
             }
 
-            current_bin_offset += bin_size;
         }
 
         writer.flush()?;
