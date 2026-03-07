@@ -22,6 +22,69 @@ use std::io::{self, Cursor, Read, Write};
 use crate::error::{Error, Result};
 use crate::structures::{HBIN_SIGNATURE, MIN_HIVE_BIN_SIZE};
 
+/// Lightweight description of a hive bin's extent (offset + size).
+///
+/// Used by both the parser and writer to track bin layout and resolve
+/// cell offsets to their containing bin via binary search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinExtent {
+    /// Offset of this bin relative to start of hive bins data.
+    pub offset: u32,
+    /// Total size of this bin (header + data), multiple of 4096.
+    pub size: u32,
+}
+
+impl BinExtent {
+    /// End offset (exclusive) of this bin.
+    #[inline]
+    pub fn end(&self) -> u32 {
+        self.offset + self.size
+    }
+
+    /// Whether `offset` falls within this bin.
+    #[inline]
+    pub fn contains(&self, offset: u32) -> bool {
+        offset >= self.offset && offset < self.end()
+    }
+}
+
+impl Default for BinExtent {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            size: MIN_HIVE_BIN_SIZE as u32,
+        }
+    }
+}
+
+pub trait HasBinExtent {
+    /// Get extents of this hive bin.
+    fn extent(&self) -> BinExtent;
+}
+impl HasBinExtent for BinExtent {
+    #[inline(always)]
+    fn extent(&self) -> BinExtent {
+        *self
+    }
+}
+
+/// Find the bin (by index) that contains `offset` via binary search.
+///
+/// Bins must be sorted by offset (the normal case for both parsed and
+/// writer-built hives). Returns `None` if no bin covers the offset.
+pub fn find_bin_index<E: HasBinExtent>(bins: &[E], offset: u32) -> Option<usize> {
+    let idx = bins.partition_point(|b| b.extent().offset <= offset);
+    // partition_point returns the first bin whose offset > offset,
+    // so the candidate is the one before it.
+    let idx = idx.checked_sub(1)?;
+    bins[idx].extent().contains(offset).then_some(idx)
+}
+
+/// Find the [`BinExtent`] that contains `offset`.
+pub fn find_bin<E: HasBinExtent>(bins: &[E], offset: u32) -> Option<&E> {
+    find_bin_index(bins, offset).map(|i| &bins[i])
+}
+
 /// Header size of a hive bin.
 pub const HIVE_BIN_HEADER_SIZE: usize = 32;
 
@@ -120,6 +183,15 @@ impl HiveBinHeader {
     }
 }
 
+impl HasBinExtent for HiveBinHeader {
+    fn extent(&self) -> BinExtent {
+        BinExtent {
+            offset: self.offset,
+            size: self.size,
+        }
+    }
+}
+
 /// A hive bin containing the header and raw cell data.
 #[derive(Debug, Clone)]
 pub struct HiveBin {
@@ -206,6 +278,13 @@ impl HiveBin {
     }
 }
 
+impl HasBinExtent for HiveBin {
+    #[inline]
+    fn extent(&self) -> BinExtent {
+        self.header.extent()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,4 +309,3 @@ mod tests {
         assert_eq!(parsed.offset(), bin.offset());
     }
 }
-
