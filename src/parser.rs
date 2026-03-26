@@ -2,7 +2,6 @@
 //!
 //! This module handles reading and parsing the raw binary data of registry hives.
 
-use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::{Error, Result};
@@ -13,9 +12,6 @@ pub struct HiveParser<R> {
     reader: R,
     base_block: BaseBlock,
     hive_bins: Vec<HiveBin>,
-    /// Map from cell offset to hive bin index.
-    #[allow(dead_code)]
-    cell_to_bin: HashMap<u32, usize>,
 }
 
 impl<R: Read + Seek> HiveParser<R> {
@@ -42,7 +38,6 @@ impl<R: Read + Seek> HiveParser<R> {
 
         // Read hive bins
         let mut hive_bins = Vec::new();
-        let mut cell_to_bin = HashMap::new();
         let mut offset = 0u32;
 
         while offset < base_block.hive_bins_data_size {
@@ -71,34 +66,6 @@ impl<R: Read + Seek> HiveParser<R> {
             reader.read_exact(&mut bin_data)?;
 
             let bin = HiveBin::parse(&bin_data)?;
-            let bin_idx = hive_bins.len();
-
-            // Map cells in this bin
-            let mut cell_offset = 0;
-            while cell_offset < bin.data.len() {
-                let cell_abs_offset = offset + HIVE_BIN_HEADER_SIZE as u32 + cell_offset as u32;
-                cell_to_bin.insert(cell_abs_offset, bin_idx);
-
-                // Read cell size
-                if cell_offset + 4 > bin.data.len() {
-                    break;
-                }
-
-                let cell_size = i32::from_le_bytes([
-                    bin.data[cell_offset],
-                    bin.data[cell_offset + 1],
-                    bin.data[cell_offset + 2],
-                    bin.data[cell_offset + 3],
-                ]);
-
-                let abs_cell_size = cell_size.abs() as usize;
-                if abs_cell_size < 8 || cell_offset + abs_cell_size > bin.data.len() {
-                    break;
-                }
-
-                cell_offset += abs_cell_size;
-            }
-
             hive_bins.push(bin);
             offset += bin_size;
         }
@@ -107,7 +74,6 @@ impl<R: Read + Seek> HiveParser<R> {
             reader,
             base_block,
             hive_bins,
-            cell_to_bin,
         })
     }
 
@@ -150,24 +116,14 @@ impl<R: Read + Seek> HiveParser<R> {
 
     /// Find the bin index and local offset for a cell offset.
     fn find_bin_for_offset(&self, offset: u32) -> Result<(usize, usize)> {
-        // Cell offset is relative to start of hive bins data
-        let mut current_offset = 0u32;
-
-        for (idx, bin) in self.hive_bins.iter().enumerate() {
-            let bin_end = current_offset + bin.header.size;
-
-            if offset >= current_offset && offset < bin_end {
-                let local_offset = (offset - current_offset) as usize;
-                if local_offset < HIVE_BIN_HEADER_SIZE {
-                    return Err(Error::InvalidCellOffset(offset));
-                }
-                return Ok((idx, local_offset - HIVE_BIN_HEADER_SIZE));
-            }
-
-            current_offset = bin_end;
+        let idx = find_bin_index(&self.hive_bins, offset)
+            .ok_or(Error::InvalidCellOffset(offset))?;
+        let bin = self.hive_bins[idx].extent();
+        let local_offset = (offset - bin.offset) as usize;
+        if local_offset < HIVE_BIN_HEADER_SIZE {
+            return Err(Error::InvalidCellOffset(offset));
         }
-
-        Err(Error::InvalidCellOffset(offset))
+        Ok((idx, local_offset - HIVE_BIN_HEADER_SIZE))
     }
 
     /// Read a key node at the given offset.
