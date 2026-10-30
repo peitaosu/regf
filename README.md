@@ -14,7 +14,7 @@ A Rust library for parsing, manipulating, and writing Windows Registry hive file
 
 ```toml
 [dependencies]
-regf = "0.1"
+regf = "0.2"
 ```
 
 ## Quick Start
