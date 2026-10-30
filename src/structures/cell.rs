@@ -153,10 +153,13 @@ impl RawCell {
 
         let mut cursor = Cursor::new(data);
         let size = cursor.read_i32::<LittleEndian>()?;
+        if size == i32::MIN {
+            return Err(Error::InvalidCellSize(size));
+        }
 
-        let abs_size = size.abs() as usize;
+        let abs_size = size.unsigned_abs() as usize;
 
-        if abs_size < MIN_CELL_SIZE {
+        if abs_size < MIN_CELL_SIZE || !abs_size.is_multiple_of(CELL_ALIGNMENT) {
             return Err(Error::InvalidCellSize(size));
         }
 
@@ -184,7 +187,7 @@ impl RawCell {
 
     /// Get the absolute size of this cell.
     pub fn abs_size(&self) -> usize {
-        self.size.abs() as usize
+        self.size.unsigned_abs() as usize
     }
 
     /// Get the data size (excluding size field).
@@ -343,6 +346,18 @@ mod tests {
         let cell = RawCell::new_allocated(vec![b'n', b'k', 0, 0], 0);
         assert!(cell.is_allocated());
         assert_eq!(cell.cell_type(), CellType::KeyNode);
+    }
+
+    #[test]
+    fn rejects_invalid_cell_sizes() {
+        for size in [i32::MIN, -9, -7, 0, 7, 9] {
+            let mut data = vec![0u8; 16];
+            data[..4].copy_from_slice(&size.to_le_bytes());
+            assert!(matches!(
+                RawCell::parse(&data, 0),
+                Err(Error::InvalidCellSize(value)) if value == size
+            ));
+        }
     }
 }
 

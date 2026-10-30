@@ -11,18 +11,18 @@ This crate implements structures and behavior described in:
 | Capability | 1.1–1.2 | 1.3 | 1.4 | 1.5 | 1.6 |
 |------------|---------|-----|-----|-----|-----|
 | Parse primary file | no | yes | yes | yes | yes |
-| Write primary file | no | partial | partial | yes | yes |
+| Write primary file | no | yes | yes | yes | yes |
 | Fast leaf | — | yes | yes | yes | yes |
 | Hash leaf | — | — | — | yes | yes |
 | Big data read | — | — | yes | yes | yes |
-| Big data write | — | — | — | yes | yes |
+| Big data write | — | — | yes | yes | yes |
 | Transaction log parse | — | — | — | yes | yes |
 | Dirty hive recovery | no | no | no | no | no |
 
 Parser entry check (`parser.rs`):
 
 ```rust
-if base_block.major_version != 1 || base_block.minor_version < 3 {
+if base_block.major_version != 1 || !(3..=6).contains(&base_block.minor_version) {
     return Err(Error::UnsupportedVersion { ... });
 }
 ```
@@ -31,12 +31,12 @@ if base_block.major_version != 1 || base_block.minor_version < 3 {
 
 ### Primary files
 
-- Base block read/write with checksum validation
-- Hive bin iteration and cell map
+- Base block read/write with checksum status
+- Exact hive bin and cell-chain validation
 - All standard cell types: nk, vk, sk, li, lf, lh, ri, db
 - Subkey list recursion through index root
 - Value data: inline, cell-resident, big data chains
-- Key security descriptor cells (parse only; not written by HiveBuilder)
+- Key security descriptor parsing, writing, linkage, and reference validation
 - FILETIME ↔ chrono conversion
 - Name hash for lh cells (`calculate_name_hash`)
 - Offline registry signature detection (`OfRg` in base block)
@@ -73,7 +73,7 @@ if base_block.major_version != 1 || base_block.minor_version < 3 {
 | Log replay / recovery | `TransactionLog` parses but does not apply dirty pages |
 | KTM / transactional registry | TxR hive states not handled |
 | In-place hive modification | Read-focused; changes require rewrite via HiveBuilder |
-| Security descriptor authoring | Default SD not attached on write |
+| Custom security descriptor authoring | HiveBuilder attaches a shared default descriptor |
 | Defragmentation | No hive compaction |
 | Layered key semantics | Flags parsed; layering logic not applied |
 | REG_LINK following | Link type recognized, not dereferenced |
@@ -85,18 +85,20 @@ if base_block.major_version != 1 || base_block.minor_version < 3 {
 
 - Default minor version: 6 (Windows 10 era)
 - Subkey lists use lf or lh depending on count thresholds in writer
-- Checksum recalculated on finalize
-- Sequence numbers set equal (clean hive)
+- Writes begin with unequal sequence numbers and finish with a clean header
+- File writes use an atomic temporary-file replacement
 - Single initial hive bin; grows as needed
 
-Security cells are omitted on newly written keys unless extended by caller.
+All newly written keys reference the shared default security cell.
 
 ## Error handling
 
 Strict validation on:
 
 - Signature mismatch
-- Checksum mismatch (optional enforcement in parser paths)
+- Checksum status and dirty-state reporting
+- Primary file type, format, and version
+- Exact bin coverage and cell starts
 - Invalid cell offsets and sizes
 - Unallocated cell dereference
 - UTF-16 decode failures
@@ -108,9 +110,9 @@ Case-insensitive key/value lookup may return first match if duplicates exist (no
 Unit tests in:
 
 - `structures/mod.rs` — checksum, hash, FILETIME
-- `parser.rs` — minimal hive roundtrip
-- `transaction_log.rs` — dirty vector bitmap
-- `writer.rs` — hive construction
+- `parser.rs` — structural corruption and big-data boundaries
+- `transaction_log.rs` — compact old/new logs, bounds, hashes, and sequences
+- `writer.rs` — metadata, Unicode ordering, durability, and hive construction
 - `reg_export.rs`, `reg_import.rs` — text format
 
 Integration examples in `examples/` directory.

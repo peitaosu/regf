@@ -89,6 +89,7 @@ pub struct OfflineRegistryInfo {
     pub flags: u32,
     /// Serialization timestamp (FILETIME, at offset 512).
     pub serialization_timestamp: u64,
+    pub legacy_layout: bool,
 }
 
 /// The base block (file header) of a registry hive.
@@ -134,6 +135,7 @@ pub struct BaseBlock {
     pub last_reorganized: u64,
     /// Checksum of first 508 bytes.
     pub checksum: u32,
+    pub checksum_valid: bool,
     /// Thaw Transaction Manager GUID (no meaning on disk, used for shadow copy recovery).
     pub thaw_tm_id: [u8; 16],
     /// Thaw Resource Manager GUID (no meaning on disk, used for shadow copy recovery).
@@ -170,6 +172,7 @@ impl Default for BaseBlock {
             guid_signature: [0; 4],
             last_reorganized: 0,
             checksum: 0,
+            checksum_valid: true,
             thaw_tm_id: [0; 16],
             thaw_rm_id: [0; 16],
             thaw_log_id: [0; 16],
@@ -238,14 +241,8 @@ impl BaseBlock {
         cursor.set_position(508);
         let checksum = cursor.read_u32::<LittleEndian>()?;
 
-        // Verify checksum
         let calculated_checksum = calculate_checksum(data);
-        if checksum != calculated_checksum {
-            return Err(Error::ChecksumMismatch {
-                expected: checksum,
-                calculated: calculated_checksum,
-            });
-        }
+        let checksum_valid = checksum == calculated_checksum;
 
         // Thaw GUIDs at offsets 4040, 4056, 4072 (used for shadow copy recovery)
         cursor.set_position(4040);
@@ -284,6 +281,7 @@ impl BaseBlock {
             cursor.read_exact(&mut ofrg_sig)?;
             if &ofrg_sig == OFRG_SIGNATURE {
                 offline_registry.present = true;
+                offline_registry.legacy_layout = true;
                 offline_registry.flags = cursor.read_u32::<LittleEndian>()?;
                 cursor.set_position(512);
                 offline_registry.serialization_timestamp = cursor.read_u64::<LittleEndian>()?;
@@ -310,6 +308,7 @@ impl BaseBlock {
             guid_signature,
             last_reorganized,
             checksum,
+            checksum_valid,
             thaw_tm_id,
             thaw_rm_id,
             thaw_log_id,
@@ -346,10 +345,6 @@ impl BaseBlock {
             cursor.write_u64::<LittleEndian>(self.last_reorganized)?;
         }
 
-        // Calculate and write checksum
-        let checksum = calculate_checksum(&buffer);
-        buffer[508..512].copy_from_slice(&checksum.to_le_bytes());
-
         // Write thaw GUIDs at offsets 4040, 4056, 4072
         buffer[4040..4056].copy_from_slice(&self.thaw_tm_id);
         buffer[4056..4072].copy_from_slice(&self.thaw_rm_id);
@@ -358,13 +353,27 @@ impl BaseBlock {
         // Write boot type and recover at the end
         buffer[4088..4092].copy_from_slice(&self.boot_type.to_le_bytes());
         buffer[4092..4096].copy_from_slice(&self.boot_recover.to_le_bytes());
+        if self.offline_registry.present {
+            let signature_offset = if self.offline_registry.legacy_layout {
+                168
+            } else {
+                176
+            };
+            buffer[signature_offset..signature_offset + 4].copy_from_slice(OFRG_SIGNATURE);
+            buffer[signature_offset + 4..signature_offset + 8]
+                .copy_from_slice(&self.offline_registry.flags.to_le_bytes());
+            buffer[512..520]
+                .copy_from_slice(&self.offline_registry.serialization_timestamp.to_le_bytes());
+        }
+        let checksum = calculate_checksum(&buffer);
+        buffer[508..512].copy_from_slice(&checksum.to_le_bytes());
 
         writer.write_all(&buffer)
     }
 
     /// Check if the hive is dirty (needs recovery).
     pub fn is_dirty(&self) -> bool {
-        self.primary_sequence != self.secondary_sequence
+        !self.checksum_valid || self.primary_sequence != self.secondary_sequence
     }
 
     /// Get the file type as an enum.
@@ -462,6 +471,36 @@ mod tests {
         let mut block = BaseBlock::default();
         block.set_file_name("SYSTEM");
         assert_eq!(block.get_file_name(), "SYSTEM");
+    }
+
+    #[test]
+    fn checksum_failure_marks_base_block_dirty() {
+        let block = BaseBlock::default();
+        let mut data = Vec::new();
+        block.write(&mut data).unwrap();
+        data[508] ^= 0xFF;
+
+        let parsed = BaseBlock::parse(&data).unwrap();
+        assert!(!parsed.checksum_valid);
+        assert!(parsed.is_dirty());
+    }
+
+    #[test]
+    fn offline_registry_metadata_roundtrips() {
+        let mut block = BaseBlock::default();
+        block.offline_registry.present = true;
+        block.offline_registry.flags = 1;
+        block.offline_registry.serialization_timestamp = 42;
+        block.offline_registry.legacy_layout = true;
+        let mut data = Vec::new();
+        block.write(&mut data).unwrap();
+
+        let parsed = BaseBlock::parse(&data).unwrap();
+        assert!(parsed.offline_registry.present);
+        assert!(parsed.offline_registry.legacy_layout);
+        assert_eq!(parsed.offline_registry.flags, 1);
+        assert_eq!(parsed.offline_registry.serialization_timestamp, 42);
+        assert!(parsed.checksum_valid);
     }
 }
 

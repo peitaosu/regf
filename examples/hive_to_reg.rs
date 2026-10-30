@@ -92,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Create a sample hive with various data types for demonstration
 fn create_sample_hive() -> Result<RegistryHive, Box<dyn std::error::Error>> {
-    let mut builder = HiveBuilder::new();
+    let mut builder = HiveBuilder::new()?;
     let root = builder.root_offset();
 
     // Create some keys and values

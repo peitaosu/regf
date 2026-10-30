@@ -46,7 +46,7 @@ for subkey in key.subkeys()? {
 ```rust
 use regf::{HiveBuilder, DataType};
 
-let mut builder = HiveBuilder::new();
+let mut builder = HiveBuilder::new()?;
 let root = builder.root_offset();
 
 // Add keys

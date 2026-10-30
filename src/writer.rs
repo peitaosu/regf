@@ -20,7 +20,7 @@
 //! root.children.push(software);
 //!
 //! // Build hive from tree (allocates with known sizes)
-//! let mut builder = HiveBuilder::from_tree(root);
+//! let mut builder = HiveBuilder::from_tree(root)?;
 //! builder.write_to_file("output.dat")?;
 //! ```
 //!
@@ -31,7 +31,7 @@
 //! ```ignore
 //! use regf::writer::HiveBuilder;
 //!
-//! let mut builder = HiveBuilder::new();
+//! let mut builder = HiveBuilder::new()?;
 //! let root = builder.root_offset();
 //! let software = builder.add_key(root, "Software")?;
 //! builder.add_value(software, "Version", DataType::String, &data)?;
@@ -40,7 +40,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufWriter, Cursor, Seek, Write};
+use std::io::{self, Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -63,6 +63,42 @@ fn align_up_u32(value: u32, alignment: u32) -> u32 {
     }
     let mask = alignment - 1;
     (value + mask) & !mask
+}
+
+fn uppercase_utf16(name: &str) -> Vec<u16> {
+    name.to_uppercase().encode_utf16().collect()
+}
+
+fn utf16_byte_len(name: &str) -> Result<usize> {
+    name.encode_utf16()
+        .count()
+        .checked_mul(2)
+        .ok_or(Error::DataTooLarge {
+            size: name.len(),
+            max: usize::MAX / 2,
+        })
+}
+
+fn output_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+pub(crate) fn atomic_write<P, F>(path: P, write: F) -> io::Result<()>
+where
+    P: AsRef<Path>,
+    F: FnOnce(&mut File) -> io::Result<()>,
+{
+    let path = path.as_ref();
+    let parent = output_parent(path);
+    let mut temporary_file = tempfile::NamedTempFile::new_in(parent)?;
+    write(temporary_file.as_file_mut())?;
+    temporary_file.as_file_mut().sync_all()?;
+    temporary_file.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// A value in the key tree.
@@ -123,10 +159,27 @@ impl KeyTreeNode {
 
     /// Sort children recursively by name (required by registry format).
     pub fn sort_recursive(&mut self) {
-        self.children.sort_by(|a, b| a.name.to_uppercase().cmp(&b.name.to_uppercase()));
+        self.children
+            .sort_by_key(|child| uppercase_utf16(&child.name));
         for child in &mut self.children {
             child.sort_recursive();
         }
+    }
+
+    fn validate_unique_children(&self) -> Result<()> {
+        let mut previous_name: Option<Vec<u16>> = None;
+        for child in &self.children {
+            let name = uppercase_utf16(&child.name);
+            if previous_name.as_ref().is_some_and(|previous| previous == &name) {
+                return Err(Error::InvalidPath(format!(
+                    "Duplicate subkey: {}",
+                    child.name
+                )));
+            }
+            child.validate_unique_children()?;
+            previous_name = Some(name);
+        }
+        Ok(())
     }
 
     /// Count total keys (including self).
@@ -163,7 +216,7 @@ pub struct HiveBuilder {
     /// - Version > 4: Use HashLeaf for subkeys lists
     /// - Version > 3: Support for Big Data
     /// - Version <= 4: Use FastLeaf for subkeys lists
-    /// - Version <= 3: No Big Data support (max value size 16344 bytes)
+    /// - Version <= 3: Store large values in a single data cell
     minor_version: u32,
 }
 
@@ -190,33 +243,36 @@ struct FreeCell {
 
 impl HiveBuilder {
     /// Create a new hive builder with default version (1.6).
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         Self::with_version(1, 6)
     }
 
     /// Create a new hive builder with a custom root name.
-    pub fn new_with_name(root_name: &str) -> Self {
+    pub fn new_with_name(root_name: &str) -> Result<Self> {
         Self::with_version_and_name(1, 6, root_name)
     }
 
     /// Create a new hive builder with a custom root name and version.
-    pub fn new_with_version(root_name: &str, minor_version: u32) -> Self {
+    pub fn new_with_version(root_name: &str, minor_version: u32) -> Result<Self> {
         Self::with_version_and_name(1, minor_version, root_name)
     }
 
     /// Create a new hive builder with specific version.
     /// 
     /// Version compatibility:
-    /// - 1.3: Basic format, no FastLeaf, no BigData
+    /// - 1.3: FastLeaf supported, no BigData
     /// - 1.4: FastLeaf supported
     /// - 1.5: HashLeaf supported, BigData supported
     /// - 1.6: Current format (recommended)
-    pub fn with_version(major: u32, minor: u32) -> Self {
+    pub fn with_version(major: u32, minor: u32) -> Result<Self> {
         Self::with_version_and_name(major, minor, "")
     }
 
     /// Create a new hive builder with specific version and root name.
-    fn with_version_and_name(major: u32, minor: u32, root_name: &str) -> Self {
+    fn with_version_and_name(major: u32, minor: u32, root_name: &str) -> Result<Self> {
+        if major != 1 || !(3..=6).contains(&minor) {
+            return Err(Error::UnsupportedVersion { major, minor });
+        }
         let mut builder = Self {
             base_block: BaseBlock::default(),
             cells: Vec::new(),
@@ -245,14 +301,14 @@ impl HiveBuilder {
         debug_assert_eq!(actual_security_offset, security_offset);
 
         // Create root key
-        let mut root_key = KeyNode::new(root_name, INVALID_OFFSET, true);
+        let mut root_key = KeyNode::new(root_name, INVALID_OFFSET, true)?;
         root_key.security_offset = actual_security_offset;
         let root_bytes = root_key.to_bytes();
         builder.root_offset = builder.allocate_cell(&root_bytes);
 
         builder.base_block.root_cell_offset = builder.root_offset;
 
-        builder
+        Ok(builder)
     }
 
     /// Build a hive from a pre-built tree structure.
@@ -264,17 +320,21 @@ impl HiveBuilder {
     /// ```ignore
     /// let mut root = KeyTreeNode::new("ROOT");
     /// root.children.push(KeyTreeNode::new("Software"));
-    /// let builder = HiveBuilder::from_tree(root);
+    /// let builder = HiveBuilder::from_tree(root)?;
     /// builder.write_to_file("output.dat")?;
     /// ```
-    pub fn from_tree(tree: KeyTreeNode) -> Self {
+    pub fn from_tree(tree: KeyTreeNode) -> Result<Self> {
         Self::from_tree_with_version(tree, 1, 6)
     }
 
     /// Build a hive from a pre-built tree structure with specific version.
-    pub fn from_tree_with_version(mut tree: KeyTreeNode, major: u32, minor: u32) -> Self {
+    pub fn from_tree_with_version(mut tree: KeyTreeNode, major: u32, minor: u32) -> Result<Self> {
+        if major != 1 || !(3..=6).contains(&minor) {
+            return Err(Error::UnsupportedVersion { major, minor });
+        }
         // Sort the tree first (required by registry format)
         tree.sort_recursive();
+        tree.validate_unique_children()?;
 
         let mut builder = Self {
             base_block: BaseBlock::default(),
@@ -294,6 +354,13 @@ impl HiveBuilder {
         // Create security descriptor
         let security_offset = HIVE_BIN_HEADER_SIZE as u32;
         let mut security = KeySecurity::new_default();
+        security.reference_count =
+            tree.count_keys()
+                .try_into()
+                .map_err(|_| Error::DataTooLarge {
+                    size: tree.count_keys(),
+                    max: u32::MAX as usize,
+                })?;
         security.set_self_referencing(security_offset);
         let security_bytes = security.to_bytes();
         let actual_security_offset = builder.allocate_cell(&security_bytes);
@@ -301,11 +368,11 @@ impl HiveBuilder {
 
         // Build the tree recursively, depth-first
         // This ensures children are allocated before parents need their offsets
-        let root_offset = builder.build_key_node(&tree, INVALID_OFFSET, actual_security_offset, true);
+        let root_offset = builder.build_key_node(&tree, INVALID_OFFSET, actual_security_offset, true)?;
         builder.root_offset = root_offset;
         builder.base_block.root_cell_offset = root_offset;
 
-        builder
+        Ok(builder)
     }
 
     /// Build a key node from a tree node (recursive, depth-first).
@@ -315,15 +382,15 @@ impl HiveBuilder {
         parent_offset: u32,
         security_offset: u32,
         is_root: bool,
-    ) -> u32 {
+    ) -> Result<u32> {
         let use_hash_leaf = self.supports_hash_leaf();
 
         // First, recursively build all children to get their offsets
         let mut child_offsets: Vec<(u32, String)> = Vec::with_capacity(tree_node.children.len());
         for child in &tree_node.children {
             // Pass INVALID_OFFSET as parent for now, we'll update it later
-            let child_offset = self.build_key_node(child, INVALID_OFFSET, security_offset, false);
-            child_offsets.push((child_offset, child.name.to_uppercase()));
+            let child_offset = self.build_key_node(child, INVALID_OFFSET, security_offset, false)?;
+            child_offsets.push((child_offset, child.name.clone()));
         }
 
         // Build values list if there are values
@@ -332,7 +399,7 @@ impl HiveBuilder {
         } else {
             let mut offsets = Vec::with_capacity(tree_node.values.len());
             for value in &tree_node.values {
-                let value_offset = self.build_value_cell(value);
+                let value_offset = self.build_value_cell(value)?;
                 offsets.push(value_offset);
             }
             // Create values list with exact size
@@ -417,32 +484,76 @@ impl HiveBuilder {
                 .iter()
                 .map(|&offset| IndexRootElement { subkeys_list_offset: offset })
                 .collect();
-            index_root.num_elements = index_root.elements.len() as u16;
+            index_root.num_elements =
+                index_root
+                    .elements
+                    .len()
+                    .try_into()
+                    .map_err(|_| Error::DataTooLarge {
+                        size: index_root.elements.len(),
+                        max: u16::MAX as usize,
+                    })?;
 
             let root_bytes = index_root.to_bytes();
             self.allocate_cell(&root_bytes)
         };
 
         // Create the key node
-        let mut key_node = KeyNode::new(&tree_node.name, parent_offset, is_root);
+        let mut key_node = KeyNode::new(&tree_node.name, parent_offset, is_root)?;
         key_node.security_offset = security_offset;
-        key_node.num_subkeys = tree_node.children.len() as u32;
+        key_node.num_subkeys =
+            tree_node
+                .children
+                .len()
+                .try_into()
+                .map_err(|_| Error::DataTooLarge {
+                    size: tree_node.children.len(),
+                    max: u32::MAX as usize,
+                })?;
         key_node.subkeys_list_offset = subkeys_list_offset;
-        key_node.num_values = tree_node.values.len() as u32;
+        key_node.num_values =
+            tree_node
+                .values
+                .len()
+                .try_into()
+                .map_err(|_| Error::DataTooLarge {
+                    size: tree_node.values.len(),
+                    max: u32::MAX as usize,
+                })?;
         key_node.values_list_offset = values_list_offset;
 
         // Calculate size tracking fields
         if !tree_node.children.is_empty() {
             key_node.largest_subkey_name_length = tree_node.children
                 .iter()
-                .map(|c| (c.name.len() * 2) as u16)
+                .map(|child| utf16_byte_len(&child.name))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .map(|length| {
+                    u16::try_from(length).map_err(|_| Error::DataTooLarge {
+                        size: length,
+                        max: u16::MAX as usize,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
                 .max()
                 .unwrap_or(0);
         }
         if !tree_node.values.is_empty() {
             key_node.largest_value_name_length = tree_node.values
                 .iter()
-                .map(|v| (v.name.len() * 2) as u32)
+                .map(|value| utf16_byte_len(&value.name))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .map(|length| {
+                    u32::try_from(length).map_err(|_| Error::DataTooLarge {
+                        size: length,
+                        max: u32::MAX as usize,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
                 .max()
                 .unwrap_or(0);
             key_node.largest_value_data_size = tree_node.values
@@ -466,31 +577,43 @@ impl HiveBuilder {
             }
         }
 
-        key_offset
+        Ok(key_offset)
     }
 
     /// Build a value cell from a tree value.
-    fn build_value_cell(&mut self, value: &KeyTreeValue) -> u32 {
-        let mut key_value = KeyValue::new(&value.name, value.data_type);
+    fn build_value_cell(&mut self, value: &KeyTreeValue) -> Result<u32> {
+        let mut key_value = KeyValue::new(&value.name, value.data_type)?;
 
         // Store data
         if value.data.len() <= MAX_RESIDENT_DATA_SIZE {
             key_value.set_resident_data(&value.data);
-        } else if value.data.len() <= BIG_DATA_THRESHOLD {
+        } else if value.data.len() > BIG_DATA_THRESHOLD && self.supports_big_data() {
+            let data_offset = self.allocate_big_data(&value.data)?;
+            key_value.data_offset = data_offset;
+            key_value.data_size = value
+                .data
+                .len()
+                .try_into()
+                .map_err(|_| Error::DataTooLarge {
+                    size: value.data.len(),
+                    max: u32::MAX as usize,
+                })?;
+        } else {
             let data_offset = self.allocate_cell(&value.data);
             key_value.data_offset = data_offset;
-            key_value.data_size = value.data.len() as u32;
-        } else if self.supports_big_data() {
-            // Big data
-            if let Ok(data_offset) = self.allocate_big_data(&value.data) {
-                key_value.data_offset = data_offset;
-                key_value.data_size = value.data.len() as u32;
-            }
+            key_value.data_size =
+                value
+                    .data
+                    .len()
+                    .try_into()
+                    .map_err(|_| Error::DataTooLarge {
+                        size: value.data.len(),
+                        max: u32::MAX as usize,
+                    })?;
         }
-        // If data is too large and big data not supported, we just don't set it
 
         let value_bytes = key_value.to_bytes();
-        self.allocate_cell(&value_bytes)
+        Ok(self.allocate_cell(&value_bytes))
     }
 
     /// Check if HashLeaf is supported (minor version > 4).
@@ -745,6 +868,16 @@ impl HiveBuilder {
 
     /// Add a subkey to a parent key.
     pub fn add_key(&mut self, parent_offset: u32, name: &str) -> Result<u32> {
+        if parent_offset != INVALID_OFFSET {
+            match self.find_subkey(parent_offset, name) {
+                Ok(_) => {
+                    return Err(Error::InvalidPath(format!("Duplicate subkey: {name}")));
+                }
+                Err(Error::KeyNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
         // Get security offset from parent
         let security_offset = if parent_offset != INVALID_OFFSET {
             let parent_cell = self.find_cell(parent_offset)?;
@@ -755,7 +888,7 @@ impl HiveBuilder {
         };
 
         // Create key node
-        let mut key_node = KeyNode::new(name, parent_offset, false);
+        let mut key_node = KeyNode::new(name, parent_offset, false)?;
         key_node.security_offset = security_offset;
 
         let key_bytes = key_node.to_bytes();
@@ -764,6 +897,7 @@ impl HiveBuilder {
         // Update parent's subkeys list
         if parent_offset != INVALID_OFFSET {
             self.add_subkey_to_parent(parent_offset, key_offset, name)?;
+            self.increment_security_reference(security_offset)?;
         }
 
         Ok(key_offset)
@@ -772,11 +906,9 @@ impl HiveBuilder {
     /// Create a name hint for FastLeaf (first 4 ASCII characters of name).
     fn create_name_hint(name: &str) -> [u8; 4] {
         let mut hint = [0u8; 4];
-        for (i, c) in name.chars().take(4).enumerate() {
-            // UTF-16LE to ASCII conversion: if char > 255, set first byte to null
-            let code = c as u32;
-            if code <= 255 {
-                hint[i] = code as u8;
+        for (index, code_unit) in name.encode_utf16().take(4).enumerate() {
+            if code_unit <= 255 {
+                hint[index] = code_unit as u8;
             } else {
                 // If any char is not ASCII-compatible, null the first byte per spec
                 hint[0] = 0;
@@ -802,7 +934,6 @@ impl HiveBuilder {
         let parent_cell = self.find_cell(parent_offset)?;
         let mut parent_node = KeyNode::parse(&parent_cell.data)?;
 
-        let name_upper = name.to_uppercase();
         let use_hash_leaf = self.supports_hash_leaf();
 
         // Collect all existing subkeys
@@ -820,7 +951,7 @@ impl HiveBuilder {
                         if let Ok(sub_list) = SubkeysList::parse(&sub_cell.data) {
                             for key_offset in sub_list.get_offsets() {
                                 if let Ok(node) = self.find_cell(key_offset).and_then(|c| KeyNode::parse(&c.data)) {
-                                    elements_with_names.push((key_offset, node.name().to_uppercase()));
+                                    elements_with_names.push((key_offset, node.name()));
                                 }
                             }
                         }
@@ -829,17 +960,16 @@ impl HiveBuilder {
             } else {
                 for offset in list.get_offsets() {
                     if let Ok(node) = self.find_cell(offset).and_then(|c| KeyNode::parse(&c.data)) {
-                        elements_with_names.push((offset, node.name().to_uppercase()));
+                        elements_with_names.push((offset, node.name()));
                     }
                 }
             }
         }
 
         // Add new element
-        elements_with_names.push((child_offset, name_upper));
+        elements_with_names.push((child_offset, name.to_string()));
 
-        // Sort by uppercase name (per spec requirement)
-        elements_with_names.sort_by(|a, b| a.1.cmp(&b.1));
+        elements_with_names.sort_by_key(|element| uppercase_utf16(&element.1));
 
         // Create the appropriate list structure based on size
         let new_list_offset = if elements_with_names.len() <= Self::MAX_LEAF_ELEMENTS {
@@ -934,17 +1064,32 @@ impl HiveBuilder {
                 .iter()
                 .map(|&offset| IndexRootElement { subkeys_list_offset: offset })
                 .collect();
-            index_root.num_elements = index_root.elements.len() as u16;
-            
+            index_root.num_elements =
+                index_root
+                    .elements
+                    .len()
+                    .try_into()
+                    .map_err(|_| Error::DataTooLarge {
+                        size: index_root.elements.len(),
+                        max: u16::MAX as usize,
+                    })?;
+
             let root_bytes = index_root.to_bytes();
             self.allocate_cell(&root_bytes)
         };
 
         parent_node.subkeys_list_offset = new_list_offset;
-        parent_node.num_subkeys += 1;
+        parent_node.num_subkeys = parent_node
+            .num_subkeys
+            .checked_add(1)
+            .ok_or_else(|| Error::CorruptHive("Subkey count overflow".to_string()))?;
+        parent_node.last_written = datetime_to_filetime(chrono::Utc::now());
 
-        // Update name length tracking
-        let name_len_utf16 = (name.len() * 2) as u16;
+        let name_length = utf16_byte_len(name)?;
+        let name_len_utf16 = u16::try_from(name_length).map_err(|_| Error::DataTooLarge {
+            size: name_length,
+            max: u16::MAX as usize,
+        })?;
         if name_len_utf16 > parent_node.largest_subkey_name_length {
             parent_node.largest_subkey_name_length = name_len_utf16;
         }
@@ -964,26 +1109,25 @@ impl HiveBuilder {
         data: &[u8],
     ) -> Result<u32> {
         // Create key value
-        let mut key_value = KeyValue::new(name, data_type);
+        let mut key_value = KeyValue::new(name, data_type)?;
 
         // Store data
         if data.len() <= MAX_RESIDENT_DATA_SIZE {
             key_value.set_resident_data(data);
-        } else if data.len() <= BIG_DATA_THRESHOLD {
-            let data_offset = self.allocate_cell(data);
-            key_value.data_offset = data_offset;
-            key_value.data_size = data.len() as u32;
-        } else if self.supports_big_data() {
-            // Big data (only supported in minor version > 3)
+        } else if data.len() > BIG_DATA_THRESHOLD && self.supports_big_data() {
             let data_offset = self.allocate_big_data(data)?;
             key_value.data_offset = data_offset;
-            key_value.data_size = data.len() as u32;
-        } else {
-            // Big data not supported in this version
-            return Err(Error::DataTooLarge {
+            key_value.data_size = data.len().try_into().map_err(|_| Error::DataTooLarge {
                 size: data.len(),
-                max: BIG_DATA_THRESHOLD,
-            });
+                max: u32::MAX as usize,
+            })?;
+        } else {
+            let data_offset = self.allocate_cell(data);
+            key_value.data_offset = data_offset;
+            key_value.data_size = data.len().try_into().map_err(|_| Error::DataTooLarge {
+                size: data.len(),
+                max: u32::MAX as usize,
+            })?;
         }
 
         let value_bytes = key_value.to_bytes();
@@ -997,7 +1141,7 @@ impl HiveBuilder {
 
     /// Allocate big data.
     fn allocate_big_data(&mut self, data: &[u8]) -> Result<u32> {
-        let num_segments = BigData::segments_needed(data.len());
+        let num_segments = BigData::segments_needed(data.len())?;
         let mut segment_offsets = Vec::with_capacity(num_segments as usize);
 
         // Allocate data segments
@@ -1065,10 +1209,17 @@ impl HiveBuilder {
             }
         }
 
-        key_node.num_values += 1;
+        key_node.num_values = key_node
+            .num_values
+            .checked_add(1)
+            .ok_or_else(|| Error::CorruptHive("Value count overflow".to_string()))?;
+        key_node.last_written = datetime_to_filetime(chrono::Utc::now());
 
-        // Update size tracking
-        let name_len_utf16 = (name.len() * 2) as u32;
+        let name_length = utf16_byte_len(name)?;
+        let name_len_utf16 = u32::try_from(name_length).map_err(|_| Error::DataTooLarge {
+            size: name_length,
+            max: u32::MAX as usize,
+        })?;
         if name_len_utf16 > key_node.largest_value_name_length {
             key_node.largest_value_name_length = name_len_utf16;
         }
@@ -1087,7 +1238,18 @@ impl HiveBuilder {
         self.cells
             .iter()
             .find(|c| c.offset == offset)
-            .ok_or_else(|| Error::InvalidCellOffset(offset))
+            .ok_or(Error::InvalidCellOffset(offset))
+    }
+
+    fn increment_security_reference(&mut self, offset: u32) -> Result<()> {
+        let cell = self.find_cell(offset)?;
+        let mut security = KeySecurity::parse(&cell.data)?;
+        security.reference_count = security
+            .reference_count
+            .checked_add(1)
+            .ok_or_else(|| Error::CorruptHive("Security reference count overflow".to_string()))?;
+        self.update_cell(offset, &security.to_bytes())?;
+        Ok(())
     }
 
     /// Update a cell's data. If data doesn't fit in compact mode, reallocates.
@@ -1098,7 +1260,7 @@ impl HiveBuilder {
         let cell_idx = self.cells
             .iter()
             .position(|c| c.offset == offset)
-            .ok_or_else(|| Error::InvalidCellOffset(offset))?;
+            .ok_or(Error::InvalidCellOffset(offset))?;
         
         if new_size <= self.cells[cell_idx].allocated_size {
             // Data fits in existing allocation
@@ -1130,13 +1292,32 @@ impl HiveBuilder {
     }
 
     /// Set the root key name.
-    pub fn set_root_name(&mut self, name: &str) {
-        if let Some(cell) = self.cells.iter_mut().find(|c| c.offset == self.root_offset) {
-            if let Ok(mut root_node) = KeyNode::parse(&cell.data) {
-                root_node.set_name(name);
-                cell.data = root_node.to_bytes();
+    pub fn set_root_name(&mut self, name: &str) -> Result<()> {
+        let cell = self.find_cell(self.root_offset)?;
+        let mut root_node = KeyNode::parse(&cell.data)?;
+        let child_offsets = if root_node.has_subkeys() {
+            let list_cell = self.find_cell(root_node.subkeys_list_offset)?;
+            let list = SubkeysList::parse(&list_cell.data)?;
+            self.get_all_key_offsets_from_list(&list)?
+        } else {
+            Vec::new()
+        };
+        let old_root_offset = self.root_offset;
+        root_node.set_name(name)?;
+        root_node.last_written = datetime_to_filetime(chrono::Utc::now());
+        let root_bytes = root_node.to_bytes();
+        let new_root_offset = self.update_cell(old_root_offset, &root_bytes)?;
+        if new_root_offset != old_root_offset {
+            for child_offset in child_offsets {
+                let child_cell = self.find_cell(child_offset)?;
+                let mut child = KeyNode::parse(&child_cell.data)?;
+                child.parent = new_root_offset;
+                self.update_cell(child_offset, &child.to_bytes())?;
             }
         }
+        self.root_offset = new_root_offset;
+        self.base_block.root_cell_offset = new_root_offset;
+        Ok(())
     }
 
     /// Find a key by path (e.g., "Software\\Microsoft\\Windows").
@@ -1176,12 +1357,10 @@ impl HiveBuilder {
 
         // Search for the key by name
         for offset in key_offsets {
-            if let Ok(cell) = self.find_cell(offset) {
-                if let Ok(node) = KeyNode::parse(&cell.data) {
-                    if node.name().to_uppercase() == name_upper {
-                        return Ok(offset);
-                    }
-                }
+            let cell = self.find_cell(offset)?;
+            let node = KeyNode::parse(&cell.data)?;
+            if node.name().to_uppercase() == name_upper {
+                return Ok(offset);
             }
         }
 
@@ -1194,13 +1373,14 @@ impl HiveBuilder {
             SubkeysList::IndexRoot(ir) => {
                 let mut all_offsets = Vec::new();
                 for elem in &ir.elements {
-                    if let Ok(sub_cell) = self.find_cell(elem.subkeys_list_offset) {
-                        if let Ok(sub_list) = SubkeysList::parse(&sub_cell.data) {
-                            // Per spec: Index Root can't point to another Index Root
-                            let sub_offsets = sub_list.get_offsets();
-                            all_offsets.extend(sub_offsets);
-                        }
+                    let sub_cell = self.find_cell(elem.subkeys_list_offset)?;
+                    let sub_list = SubkeysList::parse(&sub_cell.data)?;
+                    if sub_list.is_index_root() {
+                        return Err(Error::CorruptHive(
+                            "Index root points to another index root".to_string(),
+                        ));
                     }
+                    all_offsets.extend(sub_list.get_offsets());
                 }
                 Ok(all_offsets)
             }
@@ -1322,9 +1502,8 @@ impl HiveBuilder {
         self.base_block.hive_bins_data_size = actual_hive_size;
         self.base_block.root_cell_offset = self.root_offset;
         self.base_block.prepare_for_write();
-        self.base_block.complete_write();
 
-        // Write base block
+        writer.seek(SeekFrom::Start(0))?;
         self.base_block.write(writer)?;
 
         // Build hive bins (only bins that are needed)
@@ -1334,7 +1513,11 @@ impl HiveBuilder {
             .filter(|bin| bin.offset < actual_hive_size)
             .copied()
         {
-            let bin_header = HiveBinHeader::new(bin.offset, bin.size);
+            let mut bin_header = HiveBinHeader::new(bin.offset, bin.size)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if bin.offset == 0 {
+                bin_header.timestamp = self.base_block.last_written;
+            }
             bin_header.write(writer)?;
 
             // Write cells in this bin
@@ -1397,14 +1580,16 @@ impl HiveBuilder {
         }
 
         writer.flush()?;
+        self.base_block.complete_write();
+        writer.seek(SeekFrom::Start(0))?;
+        self.base_block.write(writer)?;
+        writer.flush()?;
         Ok(())
     }
 
     /// Build and write the hive to a file.
     pub fn write_to_file<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
-        let file = File::create(path)?;
-        let mut writer = BufWriter::new(file);
-        self.build_to_writer(&mut writer)
+        atomic_write(path, |file| self.build_to_writer(file))
     }
 
     /// Build and return the hive as bytes.
@@ -1416,12 +1601,6 @@ impl HiveBuilder {
     }
 }
 
-impl Default for HiveBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1429,7 +1608,7 @@ mod tests {
 
     #[test]
     fn test_create_empty_hive() {
-        let mut builder = HiveBuilder::new();
+        let mut builder = HiveBuilder::new().unwrap();
         let bytes = builder.to_bytes().unwrap();
 
         // Should be able to parse the created hive
@@ -1440,7 +1619,7 @@ mod tests {
 
     #[test]
     fn test_add_key() {
-        let mut builder = HiveBuilder::new();
+        let mut builder = HiveBuilder::new().unwrap();
         let root_offset = builder.root_offset();
 
         let software_offset = builder.add_key(root_offset, "Software").unwrap();
@@ -1457,7 +1636,7 @@ mod tests {
 
     #[test]
     fn test_add_value() {
-        let mut builder = HiveBuilder::new();
+        let mut builder = HiveBuilder::new().unwrap();
         let root_offset = builder.root_offset();
 
         builder
@@ -1476,7 +1655,7 @@ mod tests {
 
     #[test]
     fn test_nested_keys() {
-        let mut builder = HiveBuilder::new();
+        let mut builder = HiveBuilder::new().unwrap();
         let root_offset = builder.root_offset();
 
         let software_offset = builder.add_key(root_offset, "Software").unwrap();
@@ -1510,8 +1689,8 @@ mod tests {
         software.children.push(microsoft);
         
         root.children.push(software);
-        
-        let mut builder = HiveBuilder::from_tree(root);
+
+        let mut builder = HiveBuilder::from_tree(root).unwrap();
         let bytes = builder.to_bytes().unwrap();
         
         let hive = RegistryHive::from_bytes(bytes).unwrap();
@@ -1535,16 +1714,56 @@ mod tests {
     #[test]
     fn test_version_constructors() {
         // Test different version constructors
-        let builder1 = HiveBuilder::new();
+        let builder1 = HiveBuilder::new().unwrap();
         assert!(builder1.root_offset() > 0);
 
-        let builder2 = HiveBuilder::with_version(1, 5);
+        let builder2 = HiveBuilder::with_version(1, 5).unwrap();
         assert!(builder2.root_offset() > 0);
 
-        let mut builder3 = HiveBuilder::new_with_name("TestRoot");
+        let mut builder3 = HiveBuilder::new_with_name("TestRoot").unwrap();
         let bytes = builder3.to_bytes().unwrap();
         let hive = RegistryHive::from_bytes(bytes).unwrap();
         assert_eq!(hive.root_key().unwrap().name(), "TestRoot");
+        assert!(HiveBuilder::with_version(1, 2).is_err());
+        assert!(HiveBuilder::with_version(1, 7).is_err());
+    }
+
+    #[test]
+    fn version_1_3_stores_large_values_in_single_cells() {
+        let expected = vec![0x5a; 29_916];
+        let mut builder = HiveBuilder::with_version(1, 3).unwrap();
+        let root_offset = builder.root_offset();
+        builder
+            .add_value(root_offset, "Data", DataType::Binary, &expected)
+            .unwrap();
+        let hive = RegistryHive::from_bytes(builder.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            hive.root_key()
+                .unwrap()
+                .value("Data")
+                .unwrap()
+                .raw_data()
+                .unwrap(),
+            expected
+        );
+
+        let mut root = KeyTreeNode::new("ROOT");
+        root.values.push(KeyTreeValue {
+            name: "Data".to_string(),
+            data_type: DataType::Binary,
+            data: expected.clone(),
+        });
+        let mut builder = HiveBuilder::from_tree_with_version(root, 1, 3).unwrap();
+        let hive = RegistryHive::from_bytes(builder.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            hive.root_key()
+                .unwrap()
+                .value("Data")
+                .unwrap()
+                .raw_data()
+                .unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -1562,8 +1781,8 @@ mod tests {
         // Verify structure
         assert_eq!(root.count_keys(), 5); // ROOT + Software + Microsoft + Windows + CurrentVersion
         assert_eq!(root.count_values(), 1);
-        
-        let mut builder = HiveBuilder::from_tree(root);
+
+        let mut builder = HiveBuilder::from_tree(root).unwrap();
         let bytes = builder.to_bytes().unwrap();
         let hive = RegistryHive::from_bytes(bytes).unwrap();
         
@@ -1571,5 +1790,117 @@ mod tests {
         let values = key.values().unwrap();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].dword_data().unwrap(), 10);
+    }
+
+    #[test]
+    fn writes_security_counts_and_timestamps() {
+        let mut root = KeyTreeNode::new("ROOT");
+        root.children.push(KeyTreeNode::new("One"));
+        root.children.push(KeyTreeNode::new("Two"));
+        let mut builder = HiveBuilder::from_tree(root).unwrap();
+        let bytes = builder.to_bytes().unwrap();
+        let parser = crate::parser::HiveParser::new(Cursor::new(bytes.clone())).unwrap();
+        let root = parser.read_key_node(parser.root_cell_offset()).unwrap();
+        let security = parser.read_key_security(root.security_offset).unwrap();
+        let first_bin = HiveBin::parse(&bytes[BASE_BLOCK_SIZE..]).unwrap();
+
+        assert_eq!(security.reference_count, 3);
+        assert_ne!(root.last_written, 0);
+        assert_eq!(first_bin.header.timestamp, parser.base_block().last_written);
+    }
+
+    #[test]
+    fn writes_utf16_name_metadata_and_order() {
+        let mut builder = HiveBuilder::new().unwrap();
+        let root_offset = builder.root_offset();
+        builder.add_key(root_offset, "😀").unwrap();
+        builder.add_key(root_offset, "\u{E000}").unwrap();
+        builder
+            .add_value(root_offset, "名", DataType::Binary, &[1])
+            .unwrap();
+        let bytes = builder.to_bytes().unwrap();
+        let parser = crate::parser::HiveParser::new(Cursor::new(bytes)).unwrap();
+        let root = parser.read_key_node(parser.root_cell_offset()).unwrap();
+        let subkeys = parser.get_subkey_offsets(&root).unwrap();
+
+        assert_eq!(root.largest_subkey_name_length, 4);
+        assert_eq!(root.largest_value_name_length, 2);
+        assert_eq!(parser.read_key_node(subkeys[0]).unwrap().name(), "😀");
+        assert_eq!(parser.read_key_node(subkeys[1]).unwrap().name(), "\u{E000}");
+    }
+
+    #[test]
+    fn reallocates_root_name() {
+        let mut builder = HiveBuilder::new().unwrap();
+        let root_offset = builder.root_offset();
+        builder.add_key(root_offset, "Child").unwrap();
+        builder.set_root_name(&"根".repeat(1024)).unwrap();
+        let hive = RegistryHive::from_bytes(builder.to_bytes().unwrap()).unwrap();
+        assert_eq!(hive.root_key().unwrap().name(), "根".repeat(1024));
+        assert_eq!(hive.open_key("Child").unwrap().path().unwrap(), "根".repeat(1024) + "\\Child");
+    }
+
+    #[test]
+    fn interrupted_write_keeps_dirty_sequence_numbers() {
+        struct FailingWriter {
+            cursor: Cursor<Vec<u8>>,
+            limit: u64,
+        }
+
+        impl Write for FailingWriter {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                if self.cursor.position() + buffer.len() as u64 > self.limit {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "limit"));
+                }
+                self.cursor.write(buffer)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Seek for FailingWriter {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.cursor.seek(position)
+            }
+        }
+
+        let mut builder = HiveBuilder::new().unwrap();
+        let mut writer = FailingWriter {
+            cursor: Cursor::new(Vec::new()),
+            limit: BASE_BLOCK_SIZE as u64,
+        };
+        assert!(builder.build_to_writer(&mut writer).is_err());
+        let base_block = BaseBlock::parse(writer.cursor.get_ref()).unwrap();
+        assert_ne!(base_block.primary_sequence, base_block.secondary_sequence);
+    }
+
+    #[test]
+    fn atomic_write_preserves_existing_file_on_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hive.dat");
+        std::fs::write(&path, b"original").unwrap();
+        let result = atomic_write(&path, |file| {
+            file.write_all(b"replacement")?;
+            Err(io::Error::other("failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
+        assert_eq!(output_parent(Path::new("hive.dat")), Path::new("."));
+    }
+
+    #[test]
+    fn rejects_duplicate_subkeys() {
+        let mut builder = HiveBuilder::new().unwrap();
+        let root_offset = builder.root_offset();
+        builder.add_key(root_offset, "Name").unwrap();
+        assert!(builder.add_key(root_offset, "name").is_err());
+
+        let mut root = KeyTreeNode::new("ROOT");
+        root.children.push(KeyTreeNode::new("Name"));
+        root.children.push(KeyTreeNode::new("name"));
+        assert!(HiveBuilder::from_tree(root).is_err());
     }
 }

@@ -18,6 +18,9 @@ pub enum Error {
     #[error("Checksum mismatch: expected {expected:#010x}, calculated {calculated:#010x}")]
     ChecksumMismatch { expected: u32, calculated: u32 },
 
+    #[error("Hash mismatch: expected {expected:#018x}, calculated {calculated:#018x}")]
+    HashMismatch { expected: u64, calculated: u64 },
+
     /// Sequence number mismatch (dirty hive).
     #[error("Sequence number mismatch: primary={primary}, secondary={secondary}")]
     SequenceMismatch { primary: u32, secondary: u32 },
@@ -57,6 +60,14 @@ pub enum Error {
     /// Invalid data type.
     #[error("Invalid data type: {0}")]
     InvalidDataType(u32),
+
+    /// Invalid typed value length.
+    #[error("Invalid {data_type} data length: expected {expected} bytes, found {actual} bytes")]
+    InvalidTypedValueLength {
+        data_type: &'static str,
+        expected: usize,
+        actual: usize,
+    },
 
     /// Data too large.
     #[error("Data too large: {size} bytes (max: {max})")]

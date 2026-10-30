@@ -168,7 +168,7 @@ fn build_hive_from_reg(reg_content: &str) -> Result<HiveBuilder, Box<dyn std::er
     let parser = RegParser::new(reg_content.to_string());
     let entries = parser.parse();
     
-    let mut builder = HiveBuilder::new();
+    let mut builder = HiveBuilder::new()?;
     let root = builder.root_offset();
     
     // Track created keys: path -> offset

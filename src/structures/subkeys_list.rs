@@ -38,10 +38,9 @@ impl FastLeafElement {
     /// is set to null as per the specification.
     pub fn create_name_hint(name: &str) -> [u8; 4] {
         let mut hint = [0u8; 4];
-        for (i, c) in name.chars().take(4).enumerate() {
-            let code = c as u32;
-            if code <= 255 {
-                hint[i] = code as u8;
+        for (index, code_unit) in name.encode_utf16().take(4).enumerate() {
+            if code_unit <= 255 {
+                hint[index] = code_unit as u8;
             } else {
                 // If any char is not ASCII-compatible, null the first byte per spec
                 hint[0] = 0;

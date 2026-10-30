@@ -97,6 +97,17 @@ impl KeyValue {
         }
 
         let value_name = data[name_start..name_end].to_vec();
+        if data_size & DATA_IS_RESIDENT != 0
+            && data_size & !DATA_IS_RESIDENT > MAX_RESIDENT_DATA_SIZE as u32
+        {
+            return Err(Error::CorruptHive(format!(
+                "Resident value data size is {}",
+                data_size & !DATA_IS_RESIDENT
+            )));
+        }
+        if flags & KeyValueFlags::VALUE_COMP_NAME.bits() == 0 {
+            decode_utf16le_string(&value_name)?;
+        }
 
         Ok(Self {
             signature,
@@ -127,28 +138,25 @@ impl KeyValue {
     /// Get the value name as a string.
     pub fn name(&self) -> String {
         if self.name_length == 0 {
-            // Default value (no name)
             return String::new();
         }
 
         let value_flags = self.get_flags();
 
         if value_flags.contains(KeyValueFlags::VALUE_COMP_NAME) {
-            // ASCII name
             decode_ascii_string(&self.value_name)
         } else {
-            // UTF-16LE name
-            decode_utf16le_string(&self.value_name).unwrap_or_default()
+            decode_utf16le_string(&self.value_name).expect("validated UTF-16 value name")
         }
     }
 
     /// Set the value name.
-    pub fn set_name(&mut self, name: &str) {
+    pub fn set_name(&mut self, name: &str) -> Result<()> {
         if name.is_empty() {
             self.value_name = Vec::new();
             self.name_length = 0;
             self.flags &= !KeyValueFlags::VALUE_COMP_NAME.bits();
-            return;
+            return Ok(());
         }
 
         // Determine if we can use ASCII encoding
@@ -163,7 +171,15 @@ impl KeyValue {
             self.flags &= !KeyValueFlags::VALUE_COMP_NAME.bits();
         }
 
-        self.name_length = self.value_name.len() as u16;
+        self.name_length = self
+            .value_name
+            .len()
+            .try_into()
+            .map_err(|_| Error::DataTooLarge {
+                size: self.value_name.len(),
+                max: u16::MAX as usize,
+            })?;
+        Ok(())
     }
 
     /// Get the flags.
@@ -241,13 +257,13 @@ impl KeyValue {
     /// Create a tombstone value.
     /// Tombstone values are used in layered keys (Windows 10 RS1+) to indicate
     /// that a value has been deleted in this layer.
-    pub fn new_tombstone(name: &str) -> Self {
-        let mut value = Self::new(name, DataType::None);
+    pub fn new_tombstone(name: &str) -> Result<Self> {
+        let mut value = Self::new(name, DataType::None)?;
         value.flags |= KeyValueFlags::IS_TOMBSTONE.bits();
         value.data_type = 0; // REG_NONE
         value.data_size = 0;
         value.data_offset = INVALID_OFFSET;
-        value
+        Ok(value)
     }
 
     /// Check if this is the default value (empty name).
@@ -256,7 +272,7 @@ impl KeyValue {
     }
 
     /// Create a new key value.
-    pub fn new(name: &str, data_type: DataType) -> Self {
+    pub fn new(name: &str, data_type: DataType) -> Result<Self> {
         let mut value = Self {
             signature: *signatures::KEY_VALUE,
             name_length: 0,
@@ -268,8 +284,8 @@ impl KeyValue {
             value_name: Vec::new(),
         };
 
-        value.set_name(name);
-        value
+        value.set_name(name)?;
+        Ok(value)
     }
 
     /// Get the total size needed for this key value.
@@ -291,14 +307,14 @@ mod tests {
 
     #[test]
     fn test_key_value_creation() {
-        let value = KeyValue::new("TestValue", DataType::Dword);
+        let value = KeyValue::new("TestValue", DataType::Dword).unwrap();
         assert_eq!(value.name(), "TestValue");
         assert_eq!(value.get_data_type(), DataType::Dword);
     }
 
     #[test]
     fn test_resident_data() {
-        let mut value = KeyValue::new("Test", DataType::Dword);
+        let mut value = KeyValue::new("Test", DataType::Dword).unwrap();
         assert!(value.set_resident_data(&[1, 2, 3, 4]));
         assert!(value.is_data_resident());
         assert_eq!(value.actual_data_size(), 4);
@@ -307,13 +323,13 @@ mod tests {
 
     #[test]
     fn test_default_value() {
-        let value = KeyValue::new("", DataType::String);
+        let value = KeyValue::new("", DataType::String).unwrap();
         assert!(value.is_default());
     }
 
     #[test]
     fn test_key_value_roundtrip() {
-        let mut value = KeyValue::new("TestValue", DataType::Dword);
+        let mut value = KeyValue::new("TestValue", DataType::Dword).unwrap();
         value.set_resident_data(&[42, 0, 0, 0]);
 
         let bytes = value.to_bytes();
@@ -322,6 +338,13 @@ mod tests {
         assert_eq!(parsed.name(), value.name());
         assert_eq!(parsed.data_type, value.data_type);
         assert_eq!(parsed.get_resident_data(), value.get_resident_data());
+    }
+
+    #[test]
+    fn rejects_oversized_resident_data() {
+        let mut bytes = KeyValue::new("Value", DataType::Binary).unwrap().to_bytes();
+        bytes[4..8].copy_from_slice(&(DATA_IS_RESIDENT | 5).to_le_bytes());
+        assert!(KeyValue::parse(&bytes).is_err());
     }
 }
 

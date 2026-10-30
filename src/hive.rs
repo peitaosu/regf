@@ -2,7 +2,7 @@
 //!
 //! This module provides a user-friendly interface for working with registry hives.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read};
 use std::path::Path;
@@ -52,46 +52,8 @@ impl RegistryHive {
 
     /// Create a new empty registry hive.
     pub fn new() -> Result<Self> {
-        let mut data = vec![0u8; BASE_BLOCK_SIZE + MIN_HIVE_BIN_SIZE];
-
-        // Create base block
-        let mut base_block = BaseBlock::default();
-        base_block.root_cell_offset = HIVE_BIN_HEADER_SIZE as u32; // First cell in first bin
-        base_block.hive_bins_data_size = MIN_HIVE_BIN_SIZE as u32;
-
-        {
-            let mut cursor = Cursor::new(&mut data[..]);
-            base_block.write(&mut cursor)?;
-        }
-
-        // Create first hive bin
-        let bin = HiveBin::new(0, MIN_HIVE_BIN_SIZE as u32);
-        {
-            let mut cursor = Cursor::new(&mut data[BASE_BLOCK_SIZE..]);
-            bin.write(&mut cursor)?;
-        }
-
-        // Create root key node
-        let root_key = KeyNode::new("", INVALID_OFFSET, true);
-        let root_bytes = root_key.to_bytes();
-        let cell_size = required_cell_size(root_bytes.len());
-
-        // Write root cell
-        let cell_offset = BASE_BLOCK_SIZE + HIVE_BIN_HEADER_SIZE;
-        let cell_size_value = -(cell_size as i32);
-        data[cell_offset..cell_offset + 4].copy_from_slice(&cell_size_value.to_le_bytes());
-        data[cell_offset + 4..cell_offset + 4 + root_bytes.len()].copy_from_slice(&root_bytes);
-
-        // Write remaining free cell
-        let free_offset = cell_offset + cell_size;
-        let free_size = MIN_HIVE_BIN_SIZE - HIVE_BIN_HEADER_SIZE - cell_size;
-        data[free_offset..free_offset + 4].copy_from_slice(&(free_size as i32).to_le_bytes());
-
-        // Recalculate checksum
-        let checksum = calculate_checksum(&data[..512]);
-        data[508..512].copy_from_slice(&checksum.to_le_bytes());
-
-        Self::from_bytes(data)
+        let mut builder = crate::writer::HiveBuilder::new()?;
+        Self::from_bytes(builder.to_bytes()?)
     }
 
     /// Get the base block.
@@ -100,13 +62,13 @@ impl RegistryHive {
     }
 
     /// Get the root key.
-    pub fn root_key(&self) -> Result<RegistryKey> {
+    pub fn root_key(&self) -> Result<RegistryKey<'_>> {
         let offset = self.parser.root_cell_offset();
         self.get_key_at_offset(offset)
     }
 
     /// Get a key at a specific offset.
-    fn get_key_at_offset(&self, offset: u32) -> Result<RegistryKey> {
+    fn get_key_at_offset(&self, offset: u32) -> Result<RegistryKey<'_>> {
         let node = self.parser.read_key_node(offset)?;
         Ok(RegistryKey {
             hive: self,
@@ -116,7 +78,7 @@ impl RegistryHive {
     }
 
     /// Open a key by path.
-    pub fn open_key(&self, path: &str) -> Result<RegistryKey> {
+    pub fn open_key(&self, path: &str) -> Result<RegistryKey<'_>> {
         let root = self.root_key()?;
 
         if path.is_empty() {
@@ -159,7 +121,8 @@ impl RegistryHive {
     pub fn enumerate_all_keys(&self) -> Result<Vec<String>> {
         let root = self.root_key()?;
         let mut paths = Vec::new();
-        self.enumerate_keys_recursive(&root, String::new(), &mut paths)?;
+        let mut visited = HashSet::new();
+        self.enumerate_keys_recursive(&root, String::new(), &mut paths, &mut visited)?;
         Ok(paths)
     }
 
@@ -168,7 +131,14 @@ impl RegistryHive {
         key: &RegistryKey,
         current_path: String,
         paths: &mut Vec<String>,
+        visited: &mut HashSet<u32>,
     ) -> Result<()> {
+        if !visited.insert(key.offset) {
+            return Err(Error::CorruptHive(format!(
+                "Key traversal cycle at {:#010x}",
+                key.offset
+            )));
+        }
         let path = if current_path.is_empty() {
             key.name()
         } else if key.name().is_empty() {
@@ -182,7 +152,7 @@ impl RegistryHive {
         }
 
         for subkey in key.subkeys()? {
-            self.enumerate_keys_recursive(&subkey, path.clone(), paths)?;
+            self.enumerate_keys_recursive(&subkey, path.clone(), paths, visited)?;
         }
 
         Ok(())
@@ -210,20 +180,30 @@ impl<'a> RegistryKey<'a> {
 
     /// Get the full path to this key.
     pub fn path(&self) -> Result<String> {
+        if self.is_root() {
+            return Ok(self.name());
+        }
+
         let mut parts = vec![self.name()];
         let mut current_parent = self.node.parent;
+        let mut visited = HashSet::new();
+        visited.insert(self.offset);
 
         while current_parent != INVALID_OFFSET {
-            match self.hive.parser.read_key_node(current_parent) {
-                Ok(parent_node) => {
-                    let name = parent_node.name();
-                    if !name.is_empty() {
-                        parts.push(name);
-                    }
-                    current_parent = parent_node.parent;
-                }
-                Err(_) => break,
+            if !visited.insert(current_parent) {
+                return Err(Error::CorruptHive(format!(
+                    "Parent cycle at {current_parent:#010x}"
+                )));
             }
+            let parent_node = self.hive.parser.read_key_node(current_parent)?;
+            let name = parent_node.name();
+            if !name.is_empty() {
+                parts.push(name);
+            }
+            if parent_node.is_root() {
+                break;
+            }
+            current_parent = parent_node.parent;
         }
 
         parts.reverse();
@@ -246,8 +226,8 @@ impl<'a> RegistryKey<'a> {
     }
 
     /// Get the number of values.
-    pub fn value_count(&self) -> u32 {
-        self.node.num_values
+    pub fn value_count(&self) -> Option<u32> {
+        (!self.node.is_predef_handle()).then_some(self.node.num_values)
     }
 
     /// Get the class name.
@@ -257,7 +237,16 @@ impl<'a> RegistryKey<'a> {
         }
 
         let cell = self.hive.parser.read_cell(self.node.class_name_offset)?;
-        let name = decode_utf16le_string(&cell.data[..self.node.class_name_length as usize])?;
+        if !cell.is_allocated() {
+            return Err(Error::UnallocatedCell(self.node.class_name_offset));
+        }
+        let length = self.node.class_name_length as usize;
+        if length > cell.data.len() || !length.is_multiple_of(2) {
+            return Err(Error::CorruptHive(format!(
+                "Invalid class name length: {length}"
+            )));
+        }
+        let name = decode_utf16le_string(&cell.data[..length])?;
         Ok(Some(name))
     }
 
@@ -383,11 +372,17 @@ impl<'a> RegistryValueEntry<'a> {
     /// Get the raw data bytes.
     pub fn raw_data(&self) -> Result<Vec<u8>> {
         if self.value.is_data_resident() {
-            return Ok(self.value.get_resident_data().unwrap_or_default());
+            return self
+                .value
+                .get_resident_data()
+                .ok_or_else(|| Error::CorruptHive("Invalid resident value data".to_string()));
         }
 
         if self.value.data_offset == INVALID_OFFSET {
-            return Ok(Vec::new());
+            if self.value.actual_data_size() == 0 {
+                return Ok(Vec::new());
+            }
+            return Err(Error::InvalidCellOffset(self.value.data_offset));
         }
 
         self.hive
@@ -398,7 +393,7 @@ impl<'a> RegistryValueEntry<'a> {
     /// Get the data as a parsed RegistryValue.
     pub fn data(&self) -> Result<RegistryValue> {
         let raw_data = self.raw_data()?;
-        Ok(RegistryValue::from_bytes(self.data_type(), &raw_data))
+        RegistryValue::from_bytes(self.data_type(), &raw_data)
     }
 
     /// Get the data as a string.
@@ -457,6 +452,43 @@ mod tests {
         let (major, minor) = hive.version();
         assert_eq!(major, 1);
         assert!(minor >= 3);
+    }
+
+    #[test]
+    fn predefined_handle_is_not_a_value_count() {
+        let mut builder = crate::writer::HiveBuilder::new().unwrap();
+        let mut data = builder.to_bytes().unwrap();
+        let root_offset =
+            u32::from_le_bytes(data[36..40].try_into().unwrap()) as usize + BASE_BLOCK_SIZE;
+        let mut flags =
+            u16::from_le_bytes(data[root_offset + 6..root_offset + 8].try_into().unwrap());
+        flags |= KeyNodeFlags::KEY_PREDEF_HANDLE.bits();
+        data[root_offset + 6..root_offset + 8].copy_from_slice(&flags.to_le_bytes());
+        data[root_offset + 40..root_offset + 44].copy_from_slice(&0x80000001u32.to_le_bytes());
+
+        let hive = RegistryHive::from_bytes(data).unwrap();
+        let root = hive.root_key().unwrap();
+        assert_eq!(root.value_count(), None);
+        assert_eq!(root.raw_node().get_predef_handle(), Some(0x80000001));
+    }
+
+    #[test]
+    fn root_parent_field_has_no_effect_on_paths() {
+        let mut builder = crate::writer::HiveBuilder::new_with_name("Root").unwrap();
+        let root_offset = builder.root_offset();
+        builder.add_key(root_offset, "Child").unwrap();
+        let mut data = builder.to_bytes().unwrap();
+        let root_file_offset = BASE_BLOCK_SIZE + root_offset as usize;
+        data[root_file_offset + 20..root_file_offset + 24]
+            .copy_from_slice(&0x00000340u32.to_le_bytes());
+
+        let hive = RegistryHive::from_bytes(data).unwrap();
+        let root = hive.root_key().unwrap();
+        assert_eq!(root.path().unwrap(), "Root");
+        assert_eq!(
+            root.open_subkey("Child").unwrap().path().unwrap(),
+            "Root\\Child"
+        );
     }
 }
 

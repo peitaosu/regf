@@ -12,7 +12,7 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 use crate::error::{Error, Result};
 use crate::structures::{
-    marvin32_hash, BaseBlock, BASE_BLOCK_SIZE, MARVIN32_SEED, REGF_SIGNATURE,
+    calculate_checksum, marvin32_hash, BaseBlock, BASE_BLOCK_SIZE, MARVIN32_SEED, REGF_SIGNATURE,
 };
 
 /// Old format transaction log file.
@@ -94,7 +94,7 @@ impl DirtyVector {
     /// Create a new dirty vector with the given hive bins data size.
     pub fn new(hive_bins_data_size: u32) -> Self {
         let num_pages = (hive_bins_data_size / 512) as usize;
-        let bitmap_len = (num_pages + 7) / 8;
+        let bitmap_len = num_pages.div_ceil(8);
 
         Self {
             signature: *Self::SIGNATURE,
@@ -127,64 +127,126 @@ pub struct DirtyPage {
 impl OldFormatLog {
     /// Parse an old format transaction log from a reader.
     pub fn parse<R: Read + Seek>(mut reader: R) -> Result<Self> {
-        // Read base block (may be partial)
-        let mut base_block_data = vec![0u8; BASE_BLOCK_SIZE];
-        reader.read_exact(&mut base_block_data)?;
+        let mut first_sector = vec![0u8; 512];
+        reader.read_exact(&mut first_sector)?;
 
-        // Verify it's a transaction log
-        if &base_block_data[0..4] != REGF_SIGNATURE {
+        if &first_sector[0..4] != REGF_SIGNATURE {
             return Err(Error::InvalidSignature {
                 expected: "regf".to_string(),
-                found: String::from_utf8_lossy(&base_block_data[0..4]).to_string(),
+                found: String::from_utf8_lossy(&first_sector[0..4]).to_string(),
             });
         }
 
-        // Parse base block (may fail checksum if partial)
+        let clustering_factor = u32::from_le_bytes([
+            first_sector[44],
+            first_sector[45],
+            first_sector[46],
+            first_sector[47],
+        ]);
+        if clustering_factor != 1 && clustering_factor != 8 {
+            return Err(Error::CorruptHive(
+                format!("Invalid transaction log clustering factor: {clustering_factor}"),
+            ));
+        }
+        let base_block_copy_size = (clustering_factor as usize)
+            .checked_mul(512)
+            .ok_or_else(|| Error::CorruptHive("Base block copy size overflow".to_string()))?;
+        if base_block_copy_size > BASE_BLOCK_SIZE {
+            return Err(Error::CorruptHive(format!(
+                "Invalid base block copy size: {base_block_copy_size}"
+            )));
+        }
+        let mut partial_base_block = vec![0u8; base_block_copy_size];
+        partial_base_block[..512].copy_from_slice(&first_sector);
+        if base_block_copy_size > 512 {
+            reader.read_exact(&mut partial_base_block[512..])?;
+        }
+        let mut base_block_data = vec![0u8; BASE_BLOCK_SIZE];
+        base_block_data[..base_block_copy_size].copy_from_slice(&partial_base_block);
         let base_block = BaseBlock::parse(&base_block_data)?;
+        if !base_block.checksum_valid {
+            return Err(Error::ChecksumMismatch {
+                expected: base_block.checksum,
+                calculated: calculate_checksum(&base_block_data),
+            });
+        }
 
-        // Verify file type is transaction log
         if base_block.file_type != 1 && base_block.file_type != 2 {
             return Err(Error::CorruptHive(format!(
                 "Not a transaction log file (type={})",
                 base_block.file_type
             )));
         }
+        if base_block.file_format != 1 {
+            return Err(Error::CorruptHive(format!(
+                "Invalid transaction log file format: {}",
+                base_block.file_format
+            )));
+        }
+        if base_block.primary_sequence != base_block.secondary_sequence {
+            return Err(Error::SequenceMismatch {
+                primary: base_block.primary_sequence,
+                secondary: base_block.secondary_sequence,
+            });
+        }
+        if base_block.hive_bins_data_size % 4096 != 0 {
+            return Err(Error::CorruptHive(format!(
+                "Invalid hive bins data size: {}",
+                base_block.hive_bins_data_size
+            )));
+        }
 
-        // Read dirty vector from second sector (offset 512)
-        reader.seek(SeekFrom::Start(512))?;
-        let mut dirty_vector_data = vec![0u8; 4096]; // Read up to a sector
+        let page_count = base_block.hive_bins_data_size as usize / 512;
+        let bitmap_length = page_count.div_ceil(8);
+        let dirty_vector_size = 4usize
+            .checked_add(bitmap_length)
+            .ok_or_else(|| Error::CorruptHive("Dirty vector size overflow".to_string()))?;
+        reader.seek(SeekFrom::Start(base_block_copy_size as u64))?;
+        let mut dirty_vector_data = vec![0u8; dirty_vector_size];
         reader.read_exact(&mut dirty_vector_data)?;
 
         let dirty_vector = DirtyVector::parse(&dirty_vector_data)?;
-
-        // Calculate expected number of dirty pages
+        if !page_count.is_multiple_of(8) {
+            let used_bits = page_count % 8;
+            let unused_mask = !((1u8 << used_bits) - 1);
+            if dirty_vector
+                .bitmap
+                .last()
+                .is_some_and(|byte| byte & unused_mask != 0)
+            {
+                return Err(Error::CorruptHive(
+                    "Dirty vector has bits beyond the hive size".to_string(),
+                ));
+            }
+        }
         let dirty_count = dirty_vector.dirty_page_count();
-
-        // Read dirty pages starting after dirty vector
-        // (aligned to 512-byte boundary)
-        let dirty_vector_size = 4 + dirty_vector.bitmap.len();
-        let dirty_pages_start = 512 + ((dirty_vector_size + 511) / 512) * 512;
+        let dirty_pages_start = base_block_copy_size
+            .checked_add(dirty_vector_size.div_ceil(base_block_copy_size) * base_block_copy_size)
+            .ok_or_else(|| Error::CorruptHive("Dirty pages offset overflow".to_string()))?;
+        let dirty_pages_size = dirty_count
+            .checked_mul(512)
+            .ok_or_else(|| Error::CorruptHive("Dirty pages size overflow".to_string()))?;
+        let required_size = dirty_pages_start
+            .checked_add(dirty_pages_size)
+            .ok_or_else(|| Error::CorruptHive("Transaction log size overflow".to_string()))?;
+        let file_size = reader.seek(SeekFrom::End(0))?;
+        if required_size as u64 > file_size {
+            return Err(Error::BufferTooSmall {
+                needed: required_size,
+                available: file_size as usize,
+            });
+        }
         reader.seek(SeekFrom::Start(dirty_pages_start as u64))?;
 
         let mut dirty_pages = Vec::with_capacity(dirty_count);
-        let mut page_index = 0;
-        let num_pages = (dirty_vector.bitmap.len() * 8).min(
-            base_block.hive_bins_data_size as usize / 512,
-        );
-
-        for i in 0..num_pages {
+        for i in 0..page_count {
             if dirty_vector.is_page_dirty(i) {
                 let mut page_data = vec![0u8; 512];
-                if reader.read_exact(&mut page_data).is_ok() {
-                    dirty_pages.push(DirtyPage {
-                        offset: (i * 512) as u32,
-                        data: page_data,
-                    });
-                }
-                page_index += 1;
-                if page_index >= dirty_count {
-                    break;
-                }
+                reader.read_exact(&mut page_data)?;
+                dirty_pages.push(DirtyPage {
+                    offset: (i * 512) as u32,
+                    data: page_data,
+                });
             }
         }
 
@@ -278,6 +340,20 @@ impl LogEntry {
         let dirty_pages_count = cursor.read_u32::<LittleEndian>()?;
         let hash1 = cursor.read_u64::<LittleEndian>()?;
         let hash2 = cursor.read_u64::<LittleEndian>()?;
+        let entry_size = size as usize;
+        if entry_size != data.len()
+            || entry_size < Self::HEADER_SIZE
+            || !entry_size.is_multiple_of(512)
+        {
+            return Err(Error::CorruptHive(format!(
+                "Invalid log entry size: {size}"
+            )));
+        }
+        if flags > 1 {
+            return Err(Error::CorruptHive(format!(
+                "Invalid log entry flags: {flags:#010x}"
+            )));
+        }
 
         // Verify hive bins data size is valid
         if hive_bins_data_size % 4096 != 0 {
@@ -287,11 +363,36 @@ impl LogEntry {
             )));
         }
 
-        // Read page references
+        let references_size = (dirty_pages_count as usize)
+            .checked_mul(8)
+            .ok_or_else(|| Error::CorruptHive("Page reference size overflow".to_string()))?;
+        let data_start = Self::HEADER_SIZE
+            .checked_add(references_size)
+            .ok_or_else(|| Error::CorruptHive("Page data offset overflow".to_string()))?;
+        if data_start > entry_size {
+            return Err(Error::BufferTooSmall {
+                needed: data_start,
+                available: entry_size,
+            });
+        }
+
         let mut page_references = Vec::with_capacity(dirty_pages_count as usize);
         for _ in 0..dirty_pages_count {
             let offset = cursor.read_u32::<LittleEndian>()?;
             let page_size = cursor.read_u32::<LittleEndian>()?;
+            if page_size == 0 {
+                return Err(Error::CorruptHive(
+                    "Dirty page size is zero".to_string(),
+                ));
+            }
+            let page_end = offset
+                .checked_add(page_size)
+                .ok_or_else(|| Error::CorruptHive("Dirty page extent overflow".to_string()))?;
+            if page_end > hive_bins_data_size {
+                return Err(Error::CorruptHive(format!(
+                    "Dirty page end {page_end} exceeds hive size {hive_bins_data_size}"
+                )));
+            }
             page_references.push(DirtyPageReference {
                 offset,
                 size: page_size,
@@ -302,9 +403,11 @@ impl LogEntry {
         let mut dirty_pages = Vec::with_capacity(dirty_pages_count as usize);
         for ref_entry in &page_references {
             let pos = cursor.position() as usize;
-            let end = pos + ref_entry.size as usize;
+            let end = pos
+                .checked_add(ref_entry.size as usize)
+                .ok_or_else(|| Error::CorruptHive("Dirty page size overflow".to_string()))?;
 
-            if end > data.len() {
+            if end > entry_size {
                 return Err(Error::BufferTooSmall {
                     needed: end,
                     available: data.len(),
@@ -316,21 +419,21 @@ impl LogEntry {
         }
 
         // Verify Hash-1
-        let hash_data = &data[Self::HEADER_SIZE..size as usize];
+        let hash_data = &data[Self::HEADER_SIZE..entry_size];
         let calculated_hash1 = marvin32_hash(hash_data, MARVIN32_SEED);
         if hash1 != calculated_hash1 {
-            return Err(Error::ChecksumMismatch {
-                expected: hash1 as u32,
-                calculated: calculated_hash1 as u32,
+            return Err(Error::HashMismatch {
+                expected: hash1,
+                calculated: calculated_hash1,
             });
         }
 
         // Verify Hash-2
         let calculated_hash2 = marvin32_hash(&data[0..32], MARVIN32_SEED);
         if hash2 != calculated_hash2 {
-            return Err(Error::ChecksumMismatch {
-                expected: hash2 as u32,
-                calculated: calculated_hash2 as u32,
+            return Err(Error::HashMismatch {
+                expected: hash2,
+                calculated: calculated_hash2,
             });
         }
 
@@ -350,6 +453,20 @@ impl LogEntry {
 
     /// Write the log entry to a writer.
     pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        if self.size < Self::HEADER_SIZE as u32 || !self.size.is_multiple_of(512) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid log entry size: {}", self.size),
+            ));
+        }
+        if self.page_references.len() != self.dirty_pages.len()
+            || self.page_references.len() != self.dirty_pages_count as usize
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Dirty page count mismatch",
+            ));
+        }
         let mut buffer = Vec::new();
 
         // Write header (without hashes initially)
@@ -369,9 +486,22 @@ impl LogEntry {
         }
 
         // Write dirty pages
-        for page in &self.dirty_pages {
+        for (reference, page) in self.page_references.iter().zip(&self.dirty_pages) {
+            if reference.size == 0 || page.len() != reference.size as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Dirty page size mismatch",
+                ));
+            }
             buffer.write_all(page)?;
         }
+        if buffer.len() > self.size as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Log entry payload exceeds declared size",
+            ));
+        }
+        buffer.resize(self.size as usize, 0);
 
         // Calculate and set Hash-1
         let hash1 = marvin32_hash(&buffer[Self::HEADER_SIZE..], MARVIN32_SEED);
@@ -388,19 +518,25 @@ impl LogEntry {
 impl NewFormatLog {
     /// Parse a new format transaction log from a reader.
     pub fn parse<R: Read + Seek>(mut reader: R) -> Result<Self> {
-        // Read base block
-        let mut base_block_data = vec![0u8; BASE_BLOCK_SIZE];
-        reader.read_exact(&mut base_block_data)?;
+        let mut partial_base_block = vec![0u8; 512];
+        reader.read_exact(&mut partial_base_block)?;
 
-        // Verify it's a transaction log
-        if &base_block_data[0..4] != REGF_SIGNATURE {
+        if &partial_base_block[0..4] != REGF_SIGNATURE {
             return Err(Error::InvalidSignature {
                 expected: "regf".to_string(),
-                found: String::from_utf8_lossy(&base_block_data[0..4]).to_string(),
+                found: String::from_utf8_lossy(&partial_base_block[0..4]).to_string(),
             });
         }
 
+        let mut base_block_data = vec![0u8; BASE_BLOCK_SIZE];
+        base_block_data[..512].copy_from_slice(&partial_base_block);
         let base_block = BaseBlock::parse(&base_block_data)?;
+        if !base_block.checksum_valid {
+            return Err(Error::ChecksumMismatch {
+                expected: base_block.checksum,
+                calculated: calculate_checksum(&base_block_data),
+            });
+        }
 
         // Verify file type is new format transaction log
         if base_block.file_type != 6 {
@@ -409,48 +545,65 @@ impl NewFormatLog {
                 base_block.file_type
             )));
         }
+        if base_block.file_format != 1 {
+            return Err(Error::CorruptHive(format!(
+                "Invalid transaction log file format: {}",
+                base_block.file_format
+            )));
+        }
+        if base_block.clustering_factor != 1 {
+            return Err(Error::CorruptHive(format!(
+                "Invalid new transaction log clustering factor: {}",
+                base_block.clustering_factor
+            )));
+        }
+        if base_block.primary_sequence != base_block.secondary_sequence {
+            return Err(Error::SequenceMismatch {
+                primary: base_block.primary_sequence,
+                secondary: base_block.secondary_sequence,
+            });
+        }
 
-        // Read log entries starting from second sector
+        let file_size = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(512))?;
         let mut log_entries = Vec::new();
 
         loop {
-            // Read potential log entry header
+            let entry_start = reader.stream_position()?;
             let mut header = vec![0u8; LogEntry::HEADER_SIZE];
-            if reader.read_exact(&mut header).is_err() {
-                break;
+            match reader.read_exact(&mut header) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error.into()),
             }
 
-            // Check for HvLE signature
             if &header[0..4] != LogEntry::SIGNATURE {
                 break;
             }
 
-            // Get entry size and read full entry
             let entry_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
 
-            if entry_size < LogEntry::HEADER_SIZE as u32 || entry_size > 1024 * 1024 * 16 {
-                break; // Invalid size
+            if entry_size < LogEntry::HEADER_SIZE as u32 || !entry_size.is_multiple_of(512) {
+                break;
+            }
+            let Some(entry_end) = entry_start.checked_add(entry_size as u64) else {
+                break;
+            };
+            if entry_end > file_size {
+                break;
             }
 
             let mut entry_data = vec![0u8; entry_size as usize];
             entry_data[..LogEntry::HEADER_SIZE].copy_from_slice(&header);
 
-            let _remaining = entry_size as usize - LogEntry::HEADER_SIZE;
-            if reader.read_exact(&mut entry_data[LogEntry::HEADER_SIZE..]).is_err() {
-                break;
+            match reader.read_exact(&mut entry_data[LogEntry::HEADER_SIZE..]) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error.into()),
             }
-
             match LogEntry::parse(&entry_data) {
                 Ok(entry) => log_entries.push(entry),
-                Err(_) => break, // Stop on invalid entry
-            }
-
-            // Align to 512-byte boundary for next entry
-            let pos = reader.stream_position().unwrap_or(0);
-            let aligned_pos = (pos + 511) / 512 * 512;
-            if reader.seek(SeekFrom::Start(aligned_pos)).is_err() {
-                break;
+                Err(_) => break,
             }
         }
 
@@ -460,11 +613,24 @@ impl NewFormatLog {
         })
     }
 
-    /// Get log entries that should be applied (sequence number >= start_seq).
-    pub fn applicable_entries(&self, start_seq: u32) -> impl Iterator<Item = &LogEntry> {
-        self.log_entries
+    pub fn applicable_entries(&self, start_seq: u32) -> Result<Vec<&LogEntry>> {
+        let first = self
+            .log_entries
             .iter()
-            .filter(move |e| e.sequence_number >= start_seq)
+            .position(|entry| entry.sequence_number == start_seq)
+            .ok_or_else(|| {
+                Error::CorruptHive(format!("Expected log sequence {start_seq} is missing"))
+            })?;
+        let mut expected = start_seq;
+        let mut entries = Vec::new();
+        for entry in &self.log_entries[first..] {
+            if entry.sequence_number != expected {
+                break;
+            }
+            entries.push(entry);
+            expected = expected.wrapping_add(1);
+        }
+        Ok(entries)
     }
 }
 
@@ -480,8 +646,7 @@ pub enum TransactionLog {
 impl TransactionLog {
     /// Parse a transaction log from a reader, automatically detecting format.
     pub fn parse<R: Read + Seek>(mut reader: R) -> Result<Self> {
-        // Read and check base block file type
-        let mut base_block_data = vec![0u8; BASE_BLOCK_SIZE];
+        let mut base_block_data = vec![0u8; 512];
         reader.read_exact(&mut base_block_data)?;
 
         let file_type = u32::from_le_bytes([
@@ -516,6 +681,7 @@ impl TransactionLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structures::FileType;
 
     #[test]
     fn test_dirty_vector() {
@@ -531,6 +697,187 @@ mod tests {
         dv.set_page_dirty(0);
         dv.set_page_dirty(15);
         assert_eq!(dv.dirty_page_count(), 3);
+    }
+
+    fn log_base_block(file_type: u32) -> Vec<u8> {
+        log_base_block_with(file_type, 4096, 1)
+    }
+
+    fn log_base_block_with(
+        file_type: u32,
+        hive_bins_data_size: u32,
+        clustering_factor: u32,
+    ) -> Vec<u8> {
+        let base_block = BaseBlock {
+            file_type,
+            hive_bins_data_size,
+            clustering_factor,
+            ..BaseBlock::default()
+        };
+        let mut data = Vec::new();
+        base_block.write(&mut data).unwrap();
+        data
+    }
+
+    #[test]
+    fn parses_compact_old_format_log() {
+        let mut data = log_base_block(FileType::TransactionLog as u32)[..512].to_vec();
+        data.extend_from_slice(DirtyVector::SIGNATURE);
+        data.push(1);
+        data.resize(1024, 0);
+        data.extend_from_slice(&vec![0xAB; 512]);
+
+        let log = OldFormatLog::parse(Cursor::new(data)).unwrap();
+        assert_eq!(log.dirty_vector.bitmap, vec![1]);
+        assert_eq!(log.dirty_pages.len(), 1);
+        assert_eq!(log.dirty_pages[0].offset, 0);
+        assert_eq!(log.dirty_pages[0].data, vec![0xAB; 512]);
+    }
+
+    #[test]
+    fn parses_old_log_bitmap_lengths_and_clustering() {
+        for hive_size in [8192u32, 12_288] {
+            let mut data =
+                log_base_block_with(FileType::TransactionLog as u32, hive_size, 1)[..512].to_vec();
+            let page_count = hive_size as usize / 512;
+            let bitmap_length = page_count.div_ceil(8);
+            data.extend_from_slice(DirtyVector::SIGNATURE);
+            data.extend_from_slice(&vec![0; bitmap_length - 1]);
+            data.push(0x80);
+            data.resize(1024, 0);
+            data.extend_from_slice(&vec![0xCD; 512]);
+            let log = OldFormatLog::parse(Cursor::new(data)).unwrap();
+            assert_eq!(log.dirty_vector.bitmap.len(), bitmap_length);
+            assert_eq!(log.dirty_pages.len(), 1);
+        }
+
+        let mut clustered = log_base_block_with(FileType::TransactionLog as u32, 4096, 8);
+        clustered.extend_from_slice(DirtyVector::SIGNATURE);
+        clustered.push(1);
+        clustered.resize(8192, 0);
+        clustered.extend_from_slice(&vec![0xEF; 512]);
+        let log = OldFormatLog::parse(Cursor::new(clustered)).unwrap();
+        assert_eq!(log.dirty_pages[0].data, vec![0xEF; 512]);
+    }
+
+    #[test]
+    fn parses_compact_new_format_log() {
+        let mut data = log_base_block(FileType::TransactionLogNew as u32)[..512].to_vec();
+        let entry = LogEntry {
+            signature: *LogEntry::SIGNATURE,
+            size: 512,
+            flags: 0,
+            sequence_number: 1,
+            hive_bins_data_size: 4096,
+            dirty_pages_count: 1,
+            hash1: 0,
+            hash2: 0,
+            page_references: vec![DirtyPageReference { offset: 0, size: 4 }],
+            dirty_pages: vec![vec![1, 2, 3, 4]],
+        };
+        entry.write(&mut data).unwrap();
+
+        let log = NewFormatLog::parse(Cursor::new(data)).unwrap();
+        assert_eq!(log.log_entries.len(), 1);
+        assert_eq!(log.log_entries[0].dirty_pages[0], vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn keeps_valid_log_entry_prefix() {
+        let mut data = log_base_block(FileType::TransactionLogNew as u32)[..512].to_vec();
+        let entry = LogEntry {
+            signature: *LogEntry::SIGNATURE,
+            size: 512,
+            flags: 0,
+            sequence_number: 1,
+            hive_bins_data_size: 4096,
+            dirty_pages_count: 0,
+            hash1: 0,
+            hash2: 0,
+            page_references: Vec::new(),
+            dirty_pages: Vec::new(),
+        };
+        entry.write(&mut data).unwrap();
+        let second_entry_offset = data.len();
+        entry.write(&mut data).unwrap();
+        data[second_entry_offset + 24] ^= 0xFF;
+
+        let log = NewFormatLog::parse(Cursor::new(data)).unwrap();
+        assert_eq!(log.log_entries.len(), 1);
+    }
+
+    #[test]
+    fn rejects_invalid_log_entry_bounds() {
+        for size in [0u32, 39, 511, 1024] {
+            let mut data = vec![0u8; 512];
+            data[..4].copy_from_slice(LogEntry::SIGNATURE);
+            data[4..8].copy_from_slice(&size.to_le_bytes());
+            assert!(LogEntry::parse(&data).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_zero_sized_page_and_invalid_clustering() {
+        let entry = LogEntry {
+            signature: *LogEntry::SIGNATURE,
+            size: 512,
+            flags: 0,
+            sequence_number: 1,
+            hive_bins_data_size: 4096,
+            dirty_pages_count: 1,
+            hash1: 0,
+            hash2: 0,
+            page_references: vec![DirtyPageReference { offset: 0, size: 0 }],
+            dirty_pages: vec![Vec::new()],
+        };
+        assert!(entry.write(&mut Vec::new()).is_err());
+
+        let invalid_old =
+            log_base_block_with(FileType::TransactionLog as u32, 4096, 2);
+        assert!(OldFormatLog::parse(Cursor::new(invalid_old)).is_err());
+
+        let invalid_new =
+            log_base_block_with(FileType::TransactionLogNew as u32, 4096, 8);
+        assert!(NewFormatLog::parse(Cursor::new(invalid_new)).is_err());
+    }
+
+    #[test]
+    fn applicable_entries_stop_at_sequence_gap() {
+        let entry = |sequence_number| LogEntry {
+            signature: *LogEntry::SIGNATURE,
+            size: 512,
+            flags: 0,
+            sequence_number,
+            hive_bins_data_size: 4096,
+            dirty_pages_count: 0,
+            hash1: 0,
+            hash2: 0,
+            page_references: Vec::new(),
+            dirty_pages: Vec::new(),
+        };
+        let log = NewFormatLog {
+            base_block: BaseBlock::default(),
+            log_entries: vec![entry(5), entry(6), entry(8)],
+        };
+        let sequences = log
+            .applicable_entries(5)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.sequence_number)
+            .collect::<Vec<_>>();
+
+        assert_eq!(sequences, vec![5, 6]);
+        assert!(log.applicable_entries(4).is_err());
+    }
+
+    #[test]
+    fn rejects_log_with_invalid_base_block_checksum() {
+        let mut data = log_base_block(FileType::TransactionLog as u32)[..512].to_vec();
+        data[100] ^= 0xFF;
+        data.extend_from_slice(DirtyVector::SIGNATURE);
+        data.push(0);
+        data.resize(1024, 0);
+        assert!(OldFormatLog::parse(Cursor::new(data)).is_err());
     }
 }
 

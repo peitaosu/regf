@@ -141,43 +141,47 @@ impl RegistryValue {
     }
 
     /// Parse a value from raw bytes.
-    pub fn from_bytes(data_type: DataType, data: &[u8]) -> Self {
-        match data_type {
+    pub fn from_bytes(data_type: DataType, data: &[u8]) -> Result<Self> {
+        let value = match data_type {
             DataType::None => RegistryValue::None,
 
             DataType::String | DataType::ExpandString | DataType::Link => {
-                match decode_utf16le_string(data) {
-                    Ok(s) => RegistryValue::String(s),
-                    Err(_) => RegistryValue::Binary(data.to_vec()),
-                }
+                RegistryValue::String(decode_utf16le_string(data)?)
             }
 
-            DataType::MultiString => {
-                match decode_multi_string(data) {
-                    Ok(strings) => RegistryValue::MultiString(strings),
-                    Err(_) => RegistryValue::Binary(data.to_vec()),
-                }
-            }
+            DataType::MultiString => RegistryValue::MultiString(decode_multi_string(data)?),
 
             DataType::Dword => {
-                if data.len() < 4 {
-                    return RegistryValue::Dword(0);
+                if data.len() != 4 {
+                    return Err(Error::InvalidTypedValueLength {
+                        data_type: "REG_DWORD",
+                        expected: 4,
+                        actual: data.len(),
+                    });
                 }
                 let value = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                 RegistryValue::Dword(value)
             }
 
             DataType::DwordBigEndian => {
-                if data.len() < 4 {
-                    return RegistryValue::DwordBigEndian(0);
+                if data.len() != 4 {
+                    return Err(Error::InvalidTypedValueLength {
+                        data_type: "REG_DWORD_BIG_ENDIAN",
+                        expected: 4,
+                        actual: data.len(),
+                    });
                 }
                 let value = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
                 RegistryValue::DwordBigEndian(value)
             }
 
             DataType::Qword => {
-                if data.len() < 8 {
-                    return RegistryValue::Qword(0);
+                if data.len() != 8 {
+                    return Err(Error::InvalidTypedValueLength {
+                        data_type: "REG_QWORD",
+                        expected: 8,
+                        actual: data.len(),
+                    });
                 }
                 let value = u64::from_le_bytes([
                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
@@ -186,7 +190,8 @@ impl RegistryValue {
             }
 
             _ => RegistryValue::Binary(data.to_vec()),
-        }
+        };
+        Ok(value)
     }
 
     /// Encode the value to bytes.
@@ -214,17 +219,13 @@ pub fn decode_utf16le_string(data: &[u8]) -> Result<String> {
     if data.is_empty() {
         return Ok(String::new());
     }
+    if !data.len().is_multiple_of(2) {
+        return Err(Error::InvalidUtf16String);
+    }
 
-    // Convert bytes to u16 values
     let u16_values: Vec<u16> = data
-        .chunks(2)
-        .filter_map(|chunk| {
-            if chunk.len() == 2 {
-                Some(u16::from_le_bytes([chunk[0], chunk[1]]))
-            } else {
-                None
-            }
-        })
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect();
 
     // Find null terminator
@@ -251,34 +252,33 @@ pub fn decode_multi_string(data: &[u8]) -> Result<Vec<String>> {
     if data.is_empty() {
         return Ok(vec![]);
     }
+    if !data.len().is_multiple_of(2) {
+        return Err(Error::InvalidUtf16String);
+    }
 
-    // Convert bytes to u16 values
     let u16_values: Vec<u16> = data
-        .chunks(2)
-        .filter_map(|chunk| {
-            if chunk.len() == 2 {
-                Some(u16::from_le_bytes([chunk[0], chunk[1]]))
-            } else {
-                None
-            }
-        })
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect();
 
-    let mut strings = Vec::new();
-    let mut start = 0;
+    let trailing_null_count = u16_values
+        .iter()
+        .rev()
+        .take_while(|value| **value == 0)
+        .count();
+    if trailing_null_count == u16_values.len() {
+        return Ok(Vec::new());
+    }
+    if trailing_null_count == 0 {
+        return Err(Error::InvalidUtf16String);
+    }
 
-    for (i, &c) in u16_values.iter().enumerate() {
-        if c == 0 {
-            if start < i {
-                let s = String::from_utf16(&u16_values[start..i])
-                    .map_err(|_| Error::InvalidUtf16String)?;
-                strings.push(s);
-            } else if start == i && !strings.is_empty() {
-                // Double null terminator - end of multi-string
-                break;
-            }
-            start = i + 1;
+    let mut strings = Vec::new();
+    for segment in u16_values[..u16_values.len() - trailing_null_count].split(|value| *value == 0) {
+        if segment.is_empty() {
+            return Err(Error::InvalidUtf16String);
         }
+        strings.push(String::from_utf16(segment).map_err(|_| Error::InvalidUtf16String)?);
     }
 
     Ok(strings)
@@ -286,6 +286,9 @@ pub fn decode_multi_string(data: &[u8]) -> Result<Vec<String>> {
 
 /// Encode a multi-string to bytes.
 pub fn encode_multi_string(strings: &[String]) -> Vec<u8> {
+    if strings.is_empty() {
+        return vec![0, 0, 0, 0];
+    }
     let mut bytes = Vec::new();
 
     for s in strings {
@@ -345,7 +348,7 @@ mod tests {
     fn test_registry_value() {
         let value = RegistryValue::Dword(42);
         let bytes = value.to_bytes();
-        let parsed = RegistryValue::from_bytes(DataType::Dword, &bytes);
+        let parsed = RegistryValue::from_bytes(DataType::Dword, &bytes).unwrap();
         assert_eq!(parsed, value);
     }
 
@@ -356,6 +359,45 @@ mod tests {
         assert_eq!(dt.name(), "REG_UNKNOWN");
         assert_eq!(dt.raw_value(), 999);
         assert_eq!(u32::from(dt), 999);
+    }
+
+    #[test]
+    fn rejects_invalid_typed_data() {
+        assert!(decode_utf16le_string(&[0x41]).is_err());
+        assert!(decode_multi_string(&[0x41]).is_err());
+        assert!(decode_multi_string(&[0x41, 0]).is_err());
+        assert_eq!(decode_multi_string(&[0x41, 0, 0, 0]).unwrap(), vec!["A"]);
+        assert_eq!(decode_multi_string(&[0, 0]).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            decode_multi_string(&[0x41, 0, 0, 0, 0, 0, 0, 0]).unwrap(),
+            vec!["A"]
+        );
+        assert_eq!(encode_multi_string(&[]), vec![0, 0, 0, 0]);
+        assert_eq!(decode_multi_string(&encode_multi_string(&[])).unwrap(), Vec::<String>::new());
+        assert!(matches!(
+            RegistryValue::from_bytes(DataType::Dword, &[0; 3]),
+            Err(Error::InvalidTypedValueLength {
+                data_type: "REG_DWORD",
+                expected: 4,
+                actual: 3
+            })
+        ));
+        assert!(matches!(
+            RegistryValue::from_bytes(DataType::DwordBigEndian, &[0; 5]),
+            Err(Error::InvalidTypedValueLength {
+                data_type: "REG_DWORD_BIG_ENDIAN",
+                expected: 4,
+                actual: 5
+            })
+        ));
+        assert!(matches!(
+            RegistryValue::from_bytes(DataType::Qword, &[0; 7]),
+            Err(Error::InvalidTypedValueLength {
+                data_type: "REG_QWORD",
+                expected: 8,
+                actual: 7
+            })
+        ));
     }
 }
 

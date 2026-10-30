@@ -171,15 +171,21 @@ impl HiveBinHeader {
     }
 
     /// Create a new hive bin header.
-    pub fn new(offset: u32, size: u32) -> Self {
-        Self {
+    pub fn new(offset: u32, size: u32) -> Result<Self> {
+        if size < MIN_HIVE_BIN_SIZE as u32 || !size.is_multiple_of(MIN_HIVE_BIN_SIZE as u32) {
+            return Err(Error::InvalidHiveBin {
+                offset,
+                message: format!("Invalid size: {size}"),
+            });
+        }
+        Ok(Self {
             signature: *HBIN_SIGNATURE,
             offset,
             size,
             reserved: [0; 8],
             timestamp: 0,
             spare: 0,
-        }
+        })
     }
 }
 
@@ -230,18 +236,22 @@ impl HiveBin {
     }
 
     /// Create a new empty hive bin.
-    pub fn new(offset: u32, size: u32) -> Self {
-        let header = HiveBinHeader::new(offset, size);
+    pub fn new(offset: u32, size: u32) -> Result<Self> {
+        let header = HiveBinHeader::new(offset, size)?;
 
-        // Create cell data with a single unallocated cell
-        let cell_data_size = size as usize - HIVE_BIN_HEADER_SIZE;
+        let cell_data_size = (size as usize)
+            .checked_sub(HIVE_BIN_HEADER_SIZE)
+            .ok_or_else(|| Error::InvalidHiveBin {
+                offset,
+                message: format!("Invalid size: {size}"),
+            })?;
         let mut data = vec![0u8; cell_data_size];
 
         // Write the size of the unallocated cell (positive = unallocated)
         let cell_size = cell_data_size as i32;
         data[0..4].copy_from_slice(&cell_size.to_le_bytes());
 
-        Self { header, data }
+        Ok(Self { header, data })
     }
 
     /// Get the total size of this hive bin.
@@ -291,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_new_hive_bin() {
-        let bin = HiveBin::new(0, 4096);
+        let bin = HiveBin::new(0, 4096).unwrap();
         assert_eq!(bin.size(), 4096);
         assert_eq!(bin.offset(), 0);
         assert_eq!(bin.data.len(), 4096 - HIVE_BIN_HEADER_SIZE);
@@ -299,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_hive_bin_roundtrip() {
-        let bin = HiveBin::new(0, 4096);
+        let bin = HiveBin::new(0, 4096).unwrap();
 
         let mut buffer = Vec::new();
         bin.write(&mut buffer).unwrap();
@@ -307,5 +317,11 @@ mod tests {
         let parsed = HiveBin::parse(&buffer).unwrap();
         assert_eq!(parsed.size(), bin.size());
         assert_eq!(parsed.offset(), bin.offset());
+    }
+
+    #[test]
+    fn rejects_invalid_hive_bin_sizes() {
+        assert!(HiveBin::new(0, 0).is_err());
+        assert!(HiveBin::new(0, 4097).is_err());
     }
 }

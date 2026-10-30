@@ -6,7 +6,7 @@ Spec reference: [Format of transaction log files](Windows_registry_file_format_s
 
 ## File types
 
-Detected via base block `file type` field at offset 32:
+Detected via base block `file type` field at offset 28:
 
 | Value | Format | Windows |
 |-------|--------|---------|
@@ -58,7 +58,7 @@ Type: `NewFormatLog`
 
 ```
 ┌─────────────────────────┐
-│ Base block              │  Full 4096 bytes
+│ Base block (partial)    │  512 bytes
 ├─────────────────────────┤
 │ Log entries             │  Sequence of LogEntry
 └─────────────────────────┘
@@ -80,12 +80,12 @@ Implementation: `structures::marvin32_hash`.
 
 ### DirtyPageReference
 
-- Page index in primary file
-- Inline page data or offset
+- Byte offset relative to hive bins data
+- Page size
 
 ## Dirty state
 
-Primary hive is dirty when `sequence1 != sequence2` in base block.
+Primary hive is dirty when its checksum is invalid or its sequence numbers differ.
 
 `RegistryHive::is_dirty()` exposes this.
 
@@ -107,10 +107,10 @@ let log = TransactionLog::parse(file)?;
 match log {
     TransactionLog::Old(old) => {
         let dirty_count = old.dirty_vector.dirty_page_count();
-        // inspect old.dirty_pages
+        println!("{dirty_count}");
     }
     TransactionLog::New(new) => {
-        // inspect new.entries
+        println!("{}", new.log_entries.len());
     }
 }
 ```

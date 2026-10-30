@@ -31,7 +31,7 @@ pub use writer::{HiveBuilder, KeyTreeNode, KeyTreeValue};
 | `base_block()` | Reference to header |
 | `root_key()` | Root `RegistryKey` |
 | `open_key(path)` | Navigate by `\`-separated path |
-| `is_dirty()` | Sequence numbers differ |
+| `is_dirty()` | Checksum invalid or sequence numbers differ |
 | `file_name()` | Embedded hive name |
 | `version()` | `(major, minor)` tuple |
 | `enumerate_all_keys()` | All key paths |
@@ -45,7 +45,7 @@ pub use writer::{HiveBuilder, KeyTreeNode, KeyTreeValue};
 | `last_written()` | `DateTime<Utc>` |
 | `is_root()` | Root key check |
 | `subkey_count()` | Number of subkeys |
-| `value_count()` | Number of values |
+| `value_count()` | Number of values, or `None` for a predefined handle |
 | `class_name()` | Optional class name |
 | `subkeys()` | Child keys |
 | `open_subkey(name)` | Direct child by name |
@@ -61,23 +61,23 @@ pub use writer::{HiveBuilder, KeyTreeNode, KeyTreeValue};
 |--------|-------------|
 | `name()` | Value name |
 | `data_type()` | `DataType` enum |
-| `data()` | Raw bytes |
-| `as_string()` | Decode REG_SZ |
-| `as_dword()` | Decode REG_DWORD |
-| `as_qword()` | Decode REG_QWORD |
-| `as_multi_string()` | Decode REG_MULTI_SZ |
+| `raw_data()` | Raw bytes |
+| `data()` | Parsed `RegistryValue` |
+| `string_data()` | Decode string data |
+| `dword_data()` | Decode DWORD data |
+| `qword_data()` | Decode QWORD data |
 
 ## HiveBuilder
 
 | Method | Description |
 |--------|-------------|
-| `new()` | Empty builder |
-| `from_tree(node)` | Build from `KeyTreeNode` |
+| `new()` | Fallible empty builder |
+| `from_tree(node)` | Fallible build from `KeyTreeNode` |
 | `root_offset()` | Root cell offset |
 | `add_key(parent, name)` | Create subkey |
 | `add_value(key, type, data)` | Add value |
 | `write_to_file(path)` | Persist hive |
-| `into_bytes()` | Return hive bytes |
+| `to_bytes()` | Return hive bytes |
 
 ## KeyTreeNode / KeyTreeValue
 
@@ -164,7 +164,8 @@ Variants: `TransactionLog::Old(OldFormatLog)`, `TransactionLog::New(NewFormatLog
 |---------|-------|
 | `Io` | File I/O |
 | `InvalidSignature` | Wrong magic bytes |
-| `ChecksumMismatch` | Header checksum failure |
+| `ChecksumMismatch` | Transaction log base-block checksum failure |
+| `HashMismatch` | Marvin hash failure |
 | `SequenceMismatch` | Dirty hive indicator |
 | `InvalidCellOffset` | Out-of-range offset |
 | `InvalidCellSize` | Corrupt cell size |
@@ -172,7 +173,7 @@ Variants: `TransactionLog::Old(OldFormatLog)`, `TransactionLog::New(NewFormatLog
 | `UnknownCellType` | Unrecognized signature |
 | `KeyNotFound` | Path lookup failed |
 | `ValueNotFound` | Value name not found |
-| `UnsupportedVersion` | Hive < 1.3 |
+| `UnsupportedVersion` | Hive version outside 1.3–1.6 |
 | `CorruptHive` | General corruption |
 | `DataTooLarge` | Exceeds limits |
 | `InvalidUtf16String` | String decode failure |

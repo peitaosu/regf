@@ -79,8 +79,12 @@ impl BigData {
     }
 
     /// Calculate number of segments needed for given data size.
-    pub fn segments_needed(data_size: usize) -> u16 {
-        ((data_size + MAX_DATA_SEGMENT_SIZE - 1) / MAX_DATA_SEGMENT_SIZE) as u16
+    pub fn segments_needed(data_size: usize) -> Result<u16> {
+        let segment_count = data_size.div_ceil(MAX_DATA_SEGMENT_SIZE);
+        segment_count.try_into().map_err(|_| Error::DataTooLarge {
+            size: data_size,
+            max: u16::MAX as usize * MAX_DATA_SEGMENT_SIZE,
+        })
     }
 }
 
@@ -161,10 +165,10 @@ mod tests {
 
     #[test]
     fn test_segments_needed() {
-        assert_eq!(BigData::segments_needed(16344), 1);
-        assert_eq!(BigData::segments_needed(16345), 2);
-        assert_eq!(BigData::segments_needed(32688), 2);
-        assert_eq!(BigData::segments_needed(32689), 3);
+        assert_eq!(BigData::segments_needed(16344).unwrap(), 1);
+        assert_eq!(BigData::segments_needed(16345).unwrap(), 2);
+        assert_eq!(BigData::segments_needed(32688).unwrap(), 2);
+        assert_eq!(BigData::segments_needed(32689).unwrap(), 3);
     }
 
     #[test]

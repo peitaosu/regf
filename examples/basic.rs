@@ -11,7 +11,7 @@ use regf::reg_export::{RegExporter, RegExportOptions, RegVersion};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a new registry hive
     println!("Creating new registry hive...");
-    let mut builder = HiveBuilder::new();
+    let mut builder = HiveBuilder::new()?;
     let root = builder.root_offset();
 
     // Add some keys
@@ -55,7 +55,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nKey: {}", key.name());
     println!("Last written: {:?}", key.last_written());
     println!("Subkey count: {}", key.subkey_count());
-    println!("Value count: {}", key.value_count());
+    match key.value_count() {
+        Some(count) => println!("Value count: {}", count),
+        None => println!(
+            "Predefined handle: {:?}",
+            key.raw_node().get_predef_handle()
+        ),
+    }
 
     // Read values
     println!("\nValues:");

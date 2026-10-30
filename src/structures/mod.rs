@@ -15,8 +15,7 @@
 //! | 1.5 | XP | Hash Leaf introduced, Big Data support |
 //! | 1.6 | Vista+ | Current format, additional base block fields |
 //!
-//! This crate primarily supports versions 1.3-1.6. Versions 1.1-1.2 have a different
-//! cell structure and may not parse correctly.
+//! This crate supports versions 1.3-1.6 and rejects versions 1.1-1.2.
 //!
 //! # Cell Alignment
 //!
@@ -194,10 +193,8 @@ pub fn calculate_name_hash(name: &str) -> u32 {
     let uppercase = name.to_uppercase();
     let mut hash: u32 = 0;
 
-    for c in uppercase.chars() {
-        // Use wide character (UTF-16) code
-        let code = c as u32;
-        hash = hash.wrapping_mul(37).wrapping_add(code);
+    for code_unit in uppercase.encode_utf16() {
+        hash = hash.wrapping_mul(37).wrapping_add(code_unit as u32);
     }
 
     hash
@@ -221,6 +218,16 @@ mod tests {
     }
 
     #[test]
+    fn test_checksum_special_values() {
+        let zero = vec![0u8; 512];
+        assert_eq!(calculate_checksum(&zero), 1);
+
+        let mut all_bits = vec![0u8; 512];
+        all_bits[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(calculate_checksum(&all_bits), u32::MAX - 1);
+    }
+
+    #[test]
     fn test_name_hash() {
         // Test known hash values
         let hash = calculate_name_hash("Test");
@@ -228,6 +235,12 @@ mod tests {
 
         // Hash should be case-insensitive
         assert_eq!(calculate_name_hash("test"), calculate_name_hash("TEST"));
+    }
+
+    #[test]
+    fn test_name_hash_uses_utf16_code_units() {
+        let expected = (0xD83Du32).wrapping_mul(37).wrapping_add(0xDE00);
+        assert_eq!(calculate_name_hash("😀"), expected);
     }
 
     #[test]

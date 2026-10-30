@@ -43,8 +43,9 @@ src/
 ```
 File / bytes
   → HiveParser::new()
-      Read BaseBlock (4096 bytes), validate signature "regf"
-      Iterate HiveBin headers ("hbin"), build cell_to_bin map
+      Read BaseBlock (4096 bytes), validate primary-file invariants
+      Validate exact HiveBin coverage and index every cell start
+      Validate key, value, subkey, and security references
   → RegistryHive::from_bytes()
   → RegistryKey via root_cell_offset
       get_subkey_offsets() → SubkeysList (li/lf/lh/ri)
@@ -59,7 +60,7 @@ Two strategies in `writer.rs`:
 ### Incremental (HiveBuilder)
 
 ```
-HiveBuilder::new()
+HiveBuilder::new()?
   → add_key(parent, name)
   → add_value(key, type, data)
   → write_to_file()
@@ -71,7 +72,7 @@ Allocates cells dynamically. Suitable for programmatic construction.
 
 ```
 KeyTreeNode tree
-  → HiveBuilder::from_tree(tree)
+  → HiveBuilder::from_tree(tree)?
   → write_to_file()
 ```
 

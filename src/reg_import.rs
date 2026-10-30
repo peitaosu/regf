@@ -21,7 +21,6 @@
 //! importer.build_hive_to_file("output.dat").unwrap();
 //! ```
 
-use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -188,7 +187,7 @@ impl RegImporter {
         }
 
         // Build hive from tree
-        let mut builder = HiveBuilder::from_tree_with_version(root, 1, self.options.minor_version);
+        let mut builder = HiveBuilder::from_tree_with_version(root, 1, self.options.minor_version)?;
 
         // Build and return the hive bytes
         builder.build()
@@ -197,8 +196,7 @@ impl RegImporter {
     /// Build the hive and write it to a file.
     pub fn build_hive_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let hive_bytes = self.build_hive()?;
-        let mut file = File::create(path)?;
-        file.write_all(&hive_bytes)?;
+        crate::writer::atomic_write(path, |file| file.write_all(&hive_bytes))?;
         Ok(())
     }
 

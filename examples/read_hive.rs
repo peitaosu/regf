@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Last Written: {}", ts);
     }
     println!("Subkeys: {}", key.subkey_count());
-    println!("Values: {}", key.value_count());
+    println!("Values: {}", format_value_count(key.value_count()));
 
     // List values
     let values = key.values()?;
@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let count_info = format!(
                 "{} subkeys, {} values",
                 subkey.subkey_count(),
-                subkey.value_count()
+                format_value_count(subkey.value_count())
             );
             println!("  {}  ({})", subkey.name(), count_info);
         }
@@ -162,9 +162,13 @@ fn print_tree(
         println!("{}{}{}", prefix, connector, subkey.name());
 
         // Show value count if any
-        if subkey.value_count() > 0 {
+        if subkey.value_count().is_some_and(|count| count > 0) {
             let val_prefix = format!("{}{}    ", prefix, extension);
-            println!("{}({} values)", val_prefix, subkey.value_count());
+            println!(
+                "{}({} values)",
+                val_prefix,
+                subkey.value_count().expect("checked value count")
+            );
         }
 
         // Recurse
@@ -175,3 +179,9 @@ fn print_tree(
     Ok(())
 }
 
+fn format_value_count(value_count: Option<u32>) -> String {
+    match value_count {
+        Some(count) => count.to_string(),
+        None => "predefined handle".to_string(),
+    }
+}

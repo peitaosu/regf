@@ -285,6 +285,9 @@ impl KeyNode {
         }
 
         let key_name = data[name_start..name_end].to_vec();
+        if flags & KeyNodeFlags::KEY_COMP_NAME.bits() == 0 {
+            decode_utf16le_string(&key_name)?;
+        }
 
         Ok(Self {
             signature,
@@ -358,16 +361,14 @@ impl KeyNode {
         let key_flags = self.get_flags();
 
         if key_flags.contains(KeyNodeFlags::KEY_COMP_NAME) {
-            // ASCII name
             decode_ascii_string(&self.key_name)
         } else {
-            // UTF-16LE name
-            decode_utf16le_string(&self.key_name).unwrap_or_default()
+            decode_utf16le_string(&self.key_name).expect("validated UTF-16 key name")
         }
     }
 
     /// Set the key name.
-    pub fn set_name(&mut self, name: &str) {
+    pub fn set_name(&mut self, name: &str) -> Result<()> {
         // Determine if we can use ASCII encoding
         let can_use_ascii = name.chars().all(|c| c as u32 <= 255);
 
@@ -380,7 +381,15 @@ impl KeyNode {
             self.flags &= !KeyNodeFlags::KEY_COMP_NAME.bits();
         }
 
-        self.key_name_length = self.key_name.len() as u16;
+        self.key_name_length = self
+            .key_name
+            .len()
+            .try_into()
+            .map_err(|_| Error::DataTooLarge {
+                size: self.key_name.len(),
+                max: u16::MAX as usize,
+            })?;
+        Ok(())
     }
 
     /// Get the flags.
@@ -461,11 +470,11 @@ impl KeyNode {
     }
 
     /// Create a new key node.
-    pub fn new(name: &str, parent_offset: u32, is_root: bool) -> Self {
+    pub fn new(name: &str, parent_offset: u32, is_root: bool) -> Result<Self> {
         let mut node = Self {
             signature: *signatures::KEY_NODE,
             flags: 0,
-            last_written: 0,
+            last_written: crate::structures::datetime_to_filetime(chrono::Utc::now()),
             access_bits: 0,
             layered_key_flags: 0,
             access_spare: 0,
@@ -491,13 +500,13 @@ impl KeyNode {
             key_name: Vec::new(),
         };
 
-        node.set_name(name);
+        node.set_name(name)?;
 
         if is_root {
             node.flags |= KeyNodeFlags::KEY_HIVE_ENTRY.bits();
         }
 
-        node
+        Ok(node)
     }
 
     /// Get the total size needed for this key node.
@@ -519,24 +528,32 @@ mod tests {
 
     #[test]
     fn test_key_node_creation() {
-        let node = KeyNode::new("TestKey", 0, false);
+        let node = KeyNode::new("TestKey", 0, false).unwrap();
         assert_eq!(node.name(), "TestKey");
         assert!(!node.is_root());
     }
 
     #[test]
     fn test_key_node_root() {
-        let node = KeyNode::new("CMI-CreateHive{...}", INVALID_OFFSET, true);
+        let node = KeyNode::new("CMI-CreateHive{...}", INVALID_OFFSET, true).unwrap();
         assert!(node.is_root());
     }
 
     #[test]
     fn test_key_node_roundtrip() {
-        let node = KeyNode::new("TestKey", 100, false);
+        let node = KeyNode::new("TestKey", 100, false).unwrap();
         let bytes = node.to_bytes();
         let parsed = KeyNode::parse(&bytes).unwrap();
         assert_eq!(parsed.name(), node.name());
         assert_eq!(parsed.parent, node.parent);
+    }
+
+    #[test]
+    fn rejects_odd_utf16_name_length() {
+        let node = KeyNode::new("名", 100, false).unwrap();
+        let mut bytes = node.to_bytes();
+        bytes[72..74].copy_from_slice(&1u16.to_le_bytes());
+        assert!(KeyNode::parse(&bytes).is_err());
     }
 }
 
